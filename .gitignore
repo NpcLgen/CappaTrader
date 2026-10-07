@@ -3,11 +3,11 @@
 .env.*
 !.env.example
 
-# Runtime artefacts
-state/
-logs/
-data/
-reports/
+# Runtime artefacts (anchored to the repo root so cappatrader/data/ stays tracked)
+/state/
+/logs/
+/data/
+/reports/
 
 # Python
 __pycache__/
