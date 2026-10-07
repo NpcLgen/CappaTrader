@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cappatrader"
+version = "0.1.0"
+description = "Kantitatif algoritmik trading sistemi: rejim tespiti, ensemble sinyal, dinamik risk, walk-forward ve slippage simülasyonu"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "scikit-learn>=1.4",
+    "aiohttp>=3.10",
+    "python-dotenv>=1.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+cappatrader = "cappatrader.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["cappatrader*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

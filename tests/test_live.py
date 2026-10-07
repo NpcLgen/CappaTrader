@@ -1,0 +1,167 @@
+"""Live engine wired to a fake exchange: no network needed."""
+
+import asyncio
+
+import pandas as pd
+import pytest
+
+from cappatrader.config import Secrets
+from cappatrader.data.cleaning import KLINE_COLUMNS
+from cappatrader.live.runner import LiveEngine
+from cappatrader.live.state import StateStore
+from cappatrader.models import Decision
+from cappatrader.notify.telegram import TelegramNotifier
+from cappatrader.strategy.pipeline import prepare_universe
+
+
+class FakeREST:
+    def __init__(self, universe, restrictions=None):
+        self.u = universe
+        self.restrictions = restrictions or {"enableWithdrawals": False, "ipRestrict": True}
+
+    async def exchange_filters(self, symbols):
+        return {s: {"step_size": 1e-5, "min_qty": 0, "tick_size": 0.01, "min_notional": 5, "status": "TRADING"}
+                for s in symbols}
+
+    async def recent_klines(self, symbol, tf, n):
+        return self.u[symbol].iloc[-n - 1:-1]  # keep the final bar for the stream
+
+    async def klines_range(self, *a, **k):
+        return pd.DataFrame(columns=KLINE_COLUMNS)
+
+    async def api_restrictions(self):
+        return self.restrictions
+
+    async def ticker_price(self, symbol):
+        return float(self.u[symbol]["close"].iloc[-1])
+
+    async def funding_rate(self, symbol):
+        return None
+
+    async def close(self):
+        pass
+
+
+class CaptureNotifier(TelegramNotifier):
+    def __init__(self):
+        super().__init__("", "", enabled=False)
+        self.messages: list[str] = []
+
+    def notify(self, text: str) -> None:
+        self.messages.append(text)
+
+
+@pytest.fixture
+def live_cfg(cfg):
+    c = cfg.with_overrides({"data.tick_max_deviation": 0.5})
+    c.symbols = ["BTCUSDT", "ETHUSDT"]
+    c.pairs = [["ETHUSDT", "BTCUSDT"]]
+    return c
+
+
+def _engine(cfg, universe, **rest_kw):
+    return LiveEngine(cfg, rest=FakeREST(universe, **rest_kw), notifier=CaptureNotifier(), store=StateStore(":memory:"))
+
+
+async def _book(eng, sym, px):
+    await eng.on_stream(f"{sym.lower()}@depth20@100ms",
+                        {"lastUpdateId": 1, "bids": [[str(px * 0.9999), "50"]], "asks": [[str(px * 1.0001), "50"]]})
+
+
+def test_entry_then_tick_stop_exit_sends_telegram(live_cfg, universe):
+    async def scenario():
+        eng = _engine(live_cfg, universe)
+        await eng.bootstrap()
+        sym = "BTCUSDT"
+        px = eng.last_price[sym]
+        await _book(eng, sym, px)
+        row = prepare_universe({sym: eng.bars[sym]}, live_cfg)[sym].iloc[-1]
+        d = Decision(sym, row.name, "ENTER_LONG", 0.5, 75.0, row["regime"], "NORMAL", px, float(row["atr"]))
+        await eng.open_position(sym, d, row, {"orderflow": "Emir defteri test notu"})
+        pos = eng.account.positions[sym]
+        assert pos.entry_price == pytest.approx(px * 1.0001)  # filled at the ask of the live book
+        assert eng.account.cash < live_cfg.account.starting_balance
+        stop = pos.stop_price
+        await _book(eng, sym, stop * 0.999)
+        await eng.on_stream(f"{sym.lower()}@aggTrade", {"p": str(stop * 0.999), "q": "0.1", "m": True})
+        await asyncio.gather(*eng.tasks)
+        return eng
+
+    eng = asyncio.run(scenario())
+    assert not eng.account.positions and len(eng.account.trades) == 1
+    t = eng.account.trades[0]
+    assert t.pnl < 0 and "Zarar-kes" in t.exit_reason
+    entry, exit_ = eng.notifier.messages
+    assert "ALIŞ" in entry and "BTC/USDT" in entry and "Neden alındı" in entry and "Güncel bakiye" in entry
+    assert "SATIŞ" in exit_ and "P&amp;L" in exit_ and "Zarar-kes" in exit_ and "Güncel bakiye" in exit_
+    assert eng.store.trades()[0].pnl == pytest.approx(t.pnl)
+
+
+def test_closed_kline_runs_full_decision_cycle(live_cfg, universe):
+    async def scenario():
+        eng = _engine(live_cfg, universe)
+        await eng.bootstrap()
+        before = len(eng.bars["BTCUSDT"])
+        last = universe["BTCUSDT"].iloc[-1]
+        k = {"t": int(universe["BTCUSDT"].index[-1].value // 1_000_000), "o": last.open, "h": last.high,
+             "l": last.low, "c": last.close, "v": last.volume, "q": last.quote_volume, "V": 0.0, "x": True}
+        await eng.on_stream("btcusdt@kline_1h", {"k": k})
+        await asyncio.gather(*eng.tasks)
+        return eng, before
+
+    eng, before = asyncio.run(scenario())
+    assert eng.bars["BTCUSDT"].index[-1] == universe["BTCUSDT"].index[-1]
+    assert len(eng.bars["BTCUSDT"]) >= before
+    assert eng.ml["BTCUSDT"].model is not None
+
+
+def test_kill_switch_closes_everything(live_cfg, universe):
+    async def scenario():
+        eng = _engine(live_cfg, universe)
+        await eng.bootstrap()
+        sym = "ETHUSDT"
+        px = eng.last_price[sym]
+        await _book(eng, sym, px)
+        row = prepare_universe({sym: eng.bars[sym]}, live_cfg)[sym].iloc[-1]
+        d = Decision(sym, row.name, "ENTER_LONG", 0.5, 75.0, row["regime"], "NORMAL", px, float(row["atr"]))
+        await eng.open_position(sym, d, row, {})
+        eng.account.peak_equity = 2000.0  # pretend we were far higher
+        await eng.check_guards()
+        await asyncio.gather(*eng.tasks)
+        return eng
+
+    eng = asyncio.run(scenario())
+    assert eng.account.halted and not eng.account.positions
+    assert any("KILL-SWITCH" in m for m in eng.notifier.messages)
+
+
+def test_api_key_with_withdrawals_is_flagged(live_cfg, universe):
+    live_cfg.secrets = Secrets("key", "secret", "", "")
+
+    async def scenario():
+        eng = _engine(live_cfg, universe, restrictions={"enableWithdrawals": True, "ipRestrict": False})
+        await eng.bootstrap()
+        return eng
+
+    eng = asyncio.run(scenario())
+    assert any("PARA ÇEKME" in w for w in eng.warnings)
+    assert any("IP" in w for w in eng.warnings)
+
+
+def test_state_survives_restart(tmp_path, live_cfg, universe):
+    db = str(tmp_path / "state.sqlite")
+
+    async def open_one():
+        eng = LiveEngine(live_cfg, rest=FakeREST(universe), notifier=CaptureNotifier(), store=StateStore(db))
+        await eng.bootstrap()
+        sym = "BTCUSDT"
+        px = eng.last_price[sym]
+        await _book(eng, sym, px)
+        row = prepare_universe({sym: eng.bars[sym]}, live_cfg)[sym].iloc[-1]
+        d = Decision(sym, row.name, "ENTER_LONG", 0.5, 75.0, row["regime"], "NORMAL", px, float(row["atr"]))
+        await eng.open_position(sym, d, row, {})
+        eng.store.close()
+
+    asyncio.run(open_one())
+    acct = StateStore(db).load_account(1000)
+    assert "BTCUSDT" in acct.positions and acct.cash < 1000

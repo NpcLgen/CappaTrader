@@ -1,0 +1,63 @@
+# CappaTrader yapılandırması. Burada olmayan her ayar cappatrader/config.py içindeki
+# varsayılanı kullanır. Gizli anahtarlar (Binance, Telegram) burada DEĞİL, .env dosyasında.
+
+mode: paper                 # bu sürümde yalnızca kağıt hesap (gerçek emir gönderilmez)
+timeframe: 1h               # karar barı; 15m daha çok işlem ama maliyet/R oranı kötüleşir
+
+# Kripto pariteler + kripto altın (PAXG = 1 ons fiziki altına dayalı token)
+symbols: [BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, XRPUSDT, PAXGUSDT]
+
+# İstatistiksel arbitraj (pairs trading) çiftleri: [A, B]
+pairs:
+  - [ETHUSDT, BTCUSDT]
+  - [SOLUSDT, ETHUSDT]
+
+account:
+  starting_balance: 1000    # sanal USDT bakiyesi
+  allow_short: false        # spot = yalnızca long. true: 1x perpetual simülasyonu (short açılabilir)
+
+exchange:
+  rest_base: https://api.binance.com
+  ws_base: wss://stream.binance.com:9443
+  # Binance.com erişiminin kısıtlı olduğu bölgelerde salt piyasa verisi için:
+  # rest_base: https://data-api.binance.vision
+  # ws_base: wss://data-stream.binance.vision:9443
+
+regime:
+  adx_trend: 25             # ADX > 25 → trend rejimi (momentum/breakout)
+  adx_range: 20             # ADX < 20 → yatay rejim (RSI/Bollinger ortalamaya dönüş)
+  high_vol_pct: 0.90        # ATR% kendi geçmişinin %90 üstü → pozisyon ×0.5
+  extreme_vol_pct: 0.98     # %98 üstü → yeni işlem yok
+
+signals:
+  ema_fast: 20
+  ema_slow: 50
+  breakout_period: 55
+  ml:
+    enabled: true
+    prob_threshold: 0.65    # ML olasılığı %65'i aşmazsa oy vermez
+    horizon: 4              # kaç bar sonrasının yönü tahmin ediliyor
+
+ensemble:
+  entry_confidence: 65      # 0-100 güven skoru eşiği (PRD örneği %75)
+
+risk:
+  base_risk_per_trade: 0.01 # Kelly için yeterli geçmiş oluşana kadar işlem başı %1 risk
+  max_risk_per_trade: 0.02
+  kelly_fraction: 0.5       # yarım Kelly
+  atr_stop_mult: 2.0
+  trail_atr_mult: 3.0
+  trail_activate_r: 1.0     # 1R kâra geçince izleyen stop (en az başabaş) devreye girer
+  max_open_positions: 4
+  max_position_pct: 0.30
+  max_drawdown: 0.15        # PRD: %15 düşüşte kill-switch
+  daily_loss_limit: 0.04
+
+costs:
+  taker_fee: 0.001          # Binance spot %0.1 (BNB ile %0.075)
+  base_slippage_bps: 2
+  latency_ms: 250
+
+telegram:
+  enabled: true
+  daily_summary_hour_utc: 20

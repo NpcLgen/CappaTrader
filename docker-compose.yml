@@ -1,0 +1,11 @@
+services:
+  cappatrader:
+    build: .
+    container_name: cappatrader
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - ./state:/app/state
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+    stop_grace_period: 30s

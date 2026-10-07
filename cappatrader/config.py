@@ -1,0 +1,359 @@
+"""Configuration: YAML file for strategy/risk settings, environment for secrets."""
+
+from __future__ import annotations
+
+import copy
+import os
+from dataclasses import dataclass, field, is_dataclass
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+TIMEFRAME_MS = {
+    "1m": 60_000,
+    "3m": 180_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "30m": 1_800_000,
+    "1h": 3_600_000,
+    "2h": 7_200_000,
+    "4h": 14_400_000,
+    "1d": 86_400_000,
+}
+
+COMPONENTS = (
+    "ema_trend",
+    "macd",
+    "breakout",
+    "rsi_mr",
+    "bb_mr",
+    "statarb",
+    "ml",
+    "orderflow",
+    "sentiment",
+)
+
+
+def _default_weights() -> dict[str, dict[str, float]]:
+    # Regime-dependent ensemble weights. Momentum dominates in trends,
+    # mean-reversion dominates in ranges, a blend in transition.
+    return {
+        "TREND": {
+            "ema_trend": 1.0, "macd": 0.7, "breakout": 0.8, "rsi_mr": 0.0, "bb_mr": 0.0,
+            "statarb": 0.3, "ml": 1.0, "orderflow": 0.4, "sentiment": 0.2,
+        },
+        "RANGE": {
+            "ema_trend": 0.0, "macd": 0.2, "breakout": 0.0, "rsi_mr": 1.0, "bb_mr": 1.0,
+            "statarb": 0.6, "ml": 1.0, "orderflow": 0.4, "sentiment": 0.2,
+        },
+        "TRANSITION": {
+            "ema_trend": 0.4, "macd": 0.4, "breakout": 0.3, "rsi_mr": 0.3, "bb_mr": 0.3,
+            "statarb": 0.4, "ml": 1.0, "orderflow": 0.3, "sentiment": 0.2,
+        },
+    }
+
+
+@dataclass
+class ExchangeConfig:
+    rest_base: str = "https://api.binance.com"
+    ws_base: str = "wss://stream.binance.com:9443"
+    futures_rest_base: str = "https://fapi.binance.com"
+    recv_window_ms: int = 5000
+    request_timeout_s: float = 10.0
+    max_weight_per_minute: int = 6000
+    weight_safety: float = 0.8
+
+
+@dataclass
+class AccountConfig:
+    starting_balance: float = 1000.0
+    quote_asset: str = "USDT"
+    # Spot is long-only. True simulates a 1x perpetual account (shorts allowed).
+    allow_short: bool = False
+
+
+@dataclass
+class RegimeConfig:
+    adx_period: int = 14
+    adx_trend: float = 25.0
+    adx_range: float = 20.0
+    atr_period: int = 14
+    vol_lookback: int = 500
+    high_vol_pct: float = 0.90
+    extreme_vol_pct: float = 0.98
+
+
+@dataclass
+class StatArbConfig:
+    window: int = 200
+    entry_z: float = 2.0
+    min_corr: float = 0.6
+
+
+@dataclass
+class MLConfig:
+    enabled: bool = True
+    train_bars: int = 3000
+    retrain_every: int = 1000
+    horizon: int = 4
+    prob_threshold: float = 0.65
+    n_estimators: int = 150
+    max_depth: int = 6
+    min_samples_leaf: int = 50
+    random_state: int = 42
+
+
+@dataclass
+class SignalConfig:
+    ema_fast: int = 20
+    ema_slow: int = 50
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+    rsi_period: int = 14
+    rsi_oversold: float = 30.0
+    rsi_overbought: float = 70.0
+    bb_period: int = 20
+    bb_std: float = 2.0
+    breakout_period: int = 55
+    statarb: StatArbConfig = field(default_factory=StatArbConfig)
+    ml: MLConfig = field(default_factory=MLConfig)
+
+
+@dataclass
+class EnsembleConfig:
+    # Confidence is 50 + 50*composite (50 = neutral, 100 = every signal at max).
+    entry_confidence: float = 65.0
+    trend_exit_score: float = -0.2
+    mr_exit_score: float = 0.0
+    mr_max_hold_bars: int = 48
+    reentry_cooldown_bars: int = 4
+    weights: dict[str, dict[str, float]] = field(default_factory=_default_weights)
+
+
+@dataclass
+class RiskConfig:
+    base_risk_per_trade: float = 0.01
+    max_risk_per_trade: float = 0.02
+    min_risk_per_trade: float = 0.0025
+    kelly_fraction: float = 0.5
+    kelly_min_trades: int = 30
+    kelly_lookback: int = 100
+    atr_stop_mult: float = 2.0
+    # Round-trip trading cost may use at most this share of the initial risk (1R);
+    # a tighter ATR stop is widened (and the position shrunk) to respect it.
+    max_cost_r: float = 0.2
+    trail_atr_mult: float = 3.0
+    trail_activate_r: float = 1.0
+    take_profit_r: float | None = None
+    max_position_pct: float = 0.30
+    max_open_positions: int = 4
+    max_drawdown: float = 0.15
+    daily_loss_limit: float = 0.04
+    high_vol_size_mult: float = 0.5
+    min_notional: float = 10.0
+    flash_move_pct: float = 0.05
+    flash_window_s: int = 60
+    flash_cooldown_min: int = 30
+
+
+@dataclass
+class CostConfig:
+    taker_fee: float = 0.001
+    base_slippage_bps: float = 2.0
+    vol_slippage_coef: float = 0.05
+    impact_coef_bps: float = 10.0
+    latency_ms: float = 250.0
+    latency_z: float = 1.0
+    extra_slippage_bps: float = 0.0
+    execution_delay_bars: int = 0
+
+
+@dataclass
+class WalkForwardConfig:
+    is_bars: int = 4000
+    oos_bars: int = 1000
+    objective: str = "sharpe"
+    min_trades: int = 5
+    grid: dict[str, list[Any]] = field(default_factory=lambda: {
+        "signals.ema_fast": [12, 20],
+        "signals.ema_slow": [50, 100],
+        "risk.atr_stop_mult": [1.5, 2.5],
+        "ensemble.entry_confidence": [60, 65, 75],
+    })
+
+
+@dataclass
+class StressConfig:
+    extra_slippage_bps: list[float] = field(default_factory=lambda: [0, 2, 5, 10, 20, 30, 50])
+    latency_ms: list[float] = field(default_factory=lambda: [0, 250, 1000, 5000])
+    delay_bars: list[int] = field(default_factory=lambda: [0, 1, 2])
+
+
+@dataclass
+class DataConfig:
+    data_dir: str = "data"
+    alt_data_enabled: bool = True
+    alt_refresh_min: int = 15
+    news_feeds: list[str] = field(default_factory=lambda: [
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "https://cointelegraph.com/rss",
+    ])
+    tick_max_deviation: float = 0.03
+    outlier_mad_k: float = 8.0
+    stale_after_s: float = 30.0
+
+
+@dataclass
+class TelegramConfig:
+    enabled: bool = True
+    send_startup: bool = True
+    daily_summary_hour_utc: int = 20
+    min_interval_s: float = 1.1
+
+
+@dataclass
+class RuntimeConfig:
+    state_db: str = "state/cappatrader.sqlite"
+    log_dir: str = "logs"
+    history_bars: int = 1500
+    report_dir: str = "reports"
+
+
+@dataclass
+class Secrets:
+    binance_api_key: str = field(default="", repr=False)
+    binance_secret_key: str = field(default="", repr=False)
+    telegram_token: str = field(default="", repr=False)
+    telegram_chat_id: str = field(default="", repr=False)
+
+    @classmethod
+    def from_env(cls) -> Secrets:
+        return cls(
+            binance_api_key=os.getenv("BINANCE_API_KEY", "").strip(),
+            binance_secret_key=os.getenv("BINANCE_SECRET_KEY", "").strip(),
+            telegram_token=os.getenv("TELEGRAM_TOKEN", "").strip(),
+            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+        )
+
+    @property
+    def has_binance(self) -> bool:
+        return bool(self.binance_api_key and self.binance_secret_key)
+
+    @property
+    def has_telegram(self) -> bool:
+        return bool(self.telegram_token and self.telegram_chat_id)
+
+
+@dataclass
+class Config:
+    mode: str = "paper"
+    symbols: list[str] = field(default_factory=lambda: [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "PAXGUSDT",
+    ])
+    timeframe: str = "1h"
+    pairs: list[list[str]] = field(default_factory=lambda: [
+        ["ETHUSDT", "BTCUSDT"],
+        ["SOLUSDT", "ETHUSDT"],
+    ])
+    exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
+    account: AccountConfig = field(default_factory=AccountConfig)
+    regime: RegimeConfig = field(default_factory=RegimeConfig)
+    signals: SignalConfig = field(default_factory=SignalConfig)
+    ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
+    risk: RiskConfig = field(default_factory=RiskConfig)
+    costs: CostConfig = field(default_factory=CostConfig)
+    walkforward: WalkForwardConfig = field(default_factory=WalkForwardConfig)
+    stress: StressConfig = field(default_factory=StressConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    secrets: Secrets = field(default_factory=Secrets, repr=False)
+
+    @property
+    def bar_ms(self) -> int:
+        return TIMEFRAME_MS[self.timeframe]
+
+    @property
+    def bars_per_year(self) -> float:
+        return 365 * 86_400_000 / self.bar_ms
+
+    def with_overrides(self, overrides: dict[str, Any]) -> Config:
+        """Return a copy with dotted-path overrides, e.g. {"risk.atr_stop_mult": 2.5}."""
+        cfg = copy.deepcopy(self)
+        for path, value in overrides.items():
+            obj: Any = cfg
+            parts = path.split(".")
+            for part in parts[:-1]:
+                obj = getattr(obj, part)
+            if not hasattr(obj, parts[-1]):
+                raise ValueError(f"Bilinmeyen ayar: {path}")
+            setattr(obj, parts[-1], value)
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        errors = []
+        if self.mode != "paper":
+            errors.append("mode: bu sürümde yalnızca 'paper' destekleniyor")
+        if self.timeframe not in TIMEFRAME_MS:
+            errors.append(f"timeframe: {self.timeframe} desteklenmiyor ({', '.join(TIMEFRAME_MS)})")
+        if not self.symbols:
+            errors.append("symbols: en az bir parite gerekli")
+        if self.signals.ema_fast >= self.signals.ema_slow:
+            errors.append("signals: ema_fast < ema_slow olmalı")
+        if not 50 <= self.ensemble.entry_confidence <= 100:
+            errors.append("ensemble.entry_confidence 50-100 arasında olmalı")
+        if not 0.5 < self.signals.ml.prob_threshold < 1:
+            errors.append("signals.ml.prob_threshold 0.5-1 arasında olmalı")
+        if self.regime.adx_range > self.regime.adx_trend:
+            errors.append("regime: adx_range <= adx_trend olmalı")
+        for pair in self.pairs:
+            if len(pair) != 2 or any(s not in self.symbols for s in pair):
+                errors.append(f"pairs: {pair} iki geçerli sembol içermeli")
+        for regime, weights in self.ensemble.weights.items():
+            unknown = set(weights) - set(COMPONENTS)
+            if unknown:
+                errors.append(f"ensemble.weights.{regime}: bilinmeyen bileşen {sorted(unknown)}")
+        if not 0 < self.risk.max_drawdown < 1:
+            errors.append("risk.max_drawdown 0-1 arasında olmalı")
+        if self.account.starting_balance <= 0:
+            errors.append("account.starting_balance pozitif olmalı")
+        if errors:
+            raise ValueError("Geçersiz yapılandırma:\n  - " + "\n  - ".join(errors))
+
+
+def _apply(obj: Any, data: dict[str, Any], path: str = "") -> None:
+    for key, value in data.items():
+        full = f"{path}{key}"
+        if key == "secrets":
+            raise ValueError("Gizli anahtarlar YAML'a yazılmaz; .env kullanın")
+        if not hasattr(obj, key):
+            raise ValueError(f"Bilinmeyen ayar: {full}")
+        current = getattr(obj, key)
+        if is_dataclass(current) and isinstance(value, dict):
+            _apply(current, value, f"{full}.")
+        elif full == "ensemble.weights" and isinstance(value, dict):
+            for regime, weights in value.items():
+                current.setdefault(regime, {}).update(weights)
+        else:
+            setattr(obj, key, value)
+
+
+def load_config(path: str | os.PathLike | None = None, env_file: str | None = ".env") -> Config:
+    """Load defaults, overlay the YAML file (if any) and read secrets from the environment."""
+    if env_file:
+        from dotenv import load_dotenv
+
+        load_dotenv(env_file, override=False)
+    cfg = Config()
+    if path is None and Path("config/config.yaml").exists():
+        path = "config/config.yaml"
+    if path is not None:
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        _apply(cfg, data)
+    cfg.secrets = Secrets.from_env()
+    cfg.validate()
+    return cfg
