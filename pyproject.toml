@@ -15,7 +15,7 @@ dependencies = [
     "aiohttp>=3.11",
     "python-dotenv>=1.0",
     "PyYAML>=6.0",
-    "hmmlearn>=0.3",
+    "hmmlearn>=0.3,<0.4",
     "arch>=7.0",
     "ccxt>=4.5",
 ]

@@ -1,8 +1,10 @@
 """Binance USD-M futures broker against a ccxt-shaped fake exchange (no network)."""
 
 import asyncio
+import itertools
+import json
 import time
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urlsplit
 
 import ccxt
 import pytest
@@ -82,6 +84,8 @@ class FakeExchange:
         self.tickers = {"BNB/USDT:USDT": 600.0}
         self.fee_currency = "USDT"
         self.response_mode = "result"
+        self.partials = []  # per market order: (filled fraction, status[, fill price])
+        self.hide_new = False  # new orders stay invisible to fetch_order until reveal()
         self.create_effects = []
         self.fetch_order_effects = []
         self.margin_errors = {}
@@ -160,7 +164,7 @@ class FakeExchange:
     async def create_order(self, symbol, type, side, amount, price=None, params={}):
         self._rec("create_order", symbol, type, side, amount, price, dict(params))
         effect = self.create_effects.pop(0) if self.create_effects else None
-        if isinstance(effect, Exception):
+        if isinstance(effect, BaseException):
             raise effect
         order = self._book(symbol, side, amount, params)
         if isinstance(effect, tuple):  # the order landed, then the connection dropped
@@ -183,20 +187,26 @@ class FakeExchange:
             current = self.pos.get(symbol, 0.0)
             if current == 0 or current * sign > 0 or amount > abs(current) + 1e-12:
                 raise _err(ccxt.InvalidOrder, -2022, "ReduceOnly Order is rejected.")
-        px = self.fill_price[symbol]
+        fraction, status, *price = self.partials.pop(0) if self.partials else (1.0, "closed")
+        px = price[0] if price else self.fill_price[symbol]
+        filled = round(amount * fraction, 12)
         ts = int(time.time() * 1000)
         order = {"id": oid, "clientOrderId": cid, "symbol": symbol, "type": "market", "side": side,
-                 "amount": amount, "filled": amount, "average": px, "cost": amount * px, "status": "closed",
+                 "amount": amount, "filled": filled, "average": px, "cost": filled * px, "status": status,
                  "timestamp": ts, "lastTradeTimestamp": ts, "fee": None, "fees": [],
                  "reduceOnly": bool(params.get("reduceOnly")), "info": {"orderId": oid}}
+        if self.hide_new:
+            order["_hidden"] = True
         self.orders.append(order)
-        fee_usdt = amount * px * 0.0005
+        if status == "open":
+            self.open_regular.append(order)
+        fee_usdt = filled * px * 0.0005
         fee = fee_usdt if self.fee_currency == "USDT" else fee_usdt / self.tickers["BNB/USDT:USDT"]
-        self.trades.append({"id": "t" + oid, "order": oid, "symbol": symbol, "side": side, "amount": amount,
-                            "price": px, "cost": amount * px, "timestamp": ts,
+        self.trades.append({"id": "t" + oid, "order": oid, "symbol": symbol, "side": side, "amount": filled,
+                            "price": px, "cost": filled * px, "timestamp": ts,
                             "fee": {"cost": fee, "currency": self.fee_currency},
                             "fees": [{"cost": fee, "currency": self.fee_currency}]})
-        self.pos[symbol] = round(self.pos.get(symbol, 0.0) + sign * amount, 12)
+        self.pos[symbol] = round(self.pos.get(symbol, 0.0) + sign * filled, 12)
         self.entry.setdefault(symbol, px)
         if self.response_mode == "ack":
             return {**order, "status": "open", "filled": 0.0, "average": None, "cost": 0.0}
@@ -209,9 +219,15 @@ class FakeExchange:
         cid = params.get("clientOrderId")
         pool = self.algo if params.get("trigger") else self.orders
         for order in pool:
+            if order.get("_hidden"):
+                continue
             if (cid and order["clientOrderId"] == cid) or (not cid and order["id"] == id):
                 return dict(order)
         raise _err(ccxt.OrderNotFound, -2013, "Order does not exist.")
+
+    def reveal(self):
+        for order in self.orders + self.algo:
+            order.pop("_hidden", None)
 
     async def fetch_my_trades(self, symbol=None, since=None, limit=None, params={}):
         self._rec("fetch_my_trades", symbol, since, limit, dict(params))
@@ -242,7 +258,8 @@ class FakeExchange:
         for order in pool:
             if order["id"] == id:
                 pool.remove(order)
-                return {"id": id, "status": "canceled"}
+                order["status"] = "canceled"
+                return dict(order)
         raise _err(ccxt.OrderNotFound, -2011, "Unknown order sent.")
 
     async def close(self):
@@ -330,6 +347,41 @@ def test_demo_mode_enables_demo_trading_and_mainnet_does_not():
 def test_demo_env_refused_when_client_still_points_to_mainnet():
     with pytest.raises(LiveTradingRefused, match="mainnet"):
         run(connected(live_cfg("demo"), FakeExchange(demo_switch=False)))
+
+
+def test_demo_env_refused_when_any_endpoint_is_mainnet():
+    ex = FakeExchange()
+    ex.urls["api"]["fapiPrivateV3"] = "https://fapi.binance.com/fapi/v3"  # left out of the demo switch
+    with pytest.raises(LiveTradingRefused, match="mainnet"):
+        run(connected(live_cfg("demo"), ex))
+
+    async def flipped_after_connect():
+        broker, ex = await connected(live_cfg("demo"))
+        ex.urls["api"]["fapiPrivate"] = FAPI
+        with pytest.raises(LiveTradingRefused):
+            await broker.market_order("BTCUSDT", LONG, 0.002, 60_000.0)
+        return ex
+
+    assert "create_order" not in run(flipped_after_connect()).names()
+
+
+def test_real_ccxt_demo_switch_covers_every_endpoint_offline():
+    async def scenario():
+        demo = BinanceFuturesBroker(live_cfg("demo"), bf.build_exchange(live_cfg("demo")))
+        demo._client()  # enables demo trading and checks every base URL
+        urls = dict(demo.ex.urls["api"])
+        demo.ex.urls["api"]["fapiPrivateV2"] = "https://fapi.binance.com/fapi/v2"
+        with pytest.raises(LiveTradingRefused):
+            demo._check_endpoint()
+        main = BinanceFuturesBroker(live_cfg("mainnet"), bf.build_exchange(live_cfg("mainnet")))
+        main._client()
+        await demo.close()
+        await main.close()
+        return urls
+
+    urls = run(scenario())
+    assert {"fapiPrivate", "fapiPrivateV2", "fapiPrivateV3"} <= set(urls)
+    assert all("demo-" in u for u in urls.values())
 
 
 def test_connect_maps_symbols_and_sets_margin_and_leverage():
@@ -479,6 +531,40 @@ def test_fill_from_fetch_order_and_bnb_fee_conversion():
     assert ("fetch_ticker", ("BNB/USDT:USDT",)) in ex.calls
 
 
+def test_partially_filled_working_market_order_is_settled_before_reporting():
+    async def scenario():
+        ex = FakeExchange()
+        broker, _ = await connected(ex=ex)
+        ex.partials = [(0.5, "open")]
+        fill = await broker.market_order("BTCUSDT", LONG, 0.004, 60_000.0)
+        return fill, ex
+
+    fill, ex = run(scenario())
+    oid = ex.orders[0]["id"]
+    assert (oid, BTC, {}) in ex.args("cancel_order")  # the unfilled rest is cancelled first
+    assert ex.orders[0]["status"] == "canceled" and ex.open_regular == []
+    assert fill.qty == pytest.approx(0.002) and ex.pos[BTC] == pytest.approx(0.002)
+
+
+def test_partial_fill_that_cannot_be_settled_is_state_unknown():
+    async def scenario():
+        ex = FakeExchange()
+        broker, _ = await connected(ex=ex)
+
+        async def cancel_down(id, symbol=None, params={}):
+            raise ccxt.ExchangeNotAvailable("binanceusdm 503")
+
+        ex.cancel_order = cancel_down
+        ex.partials = [(0.5, "open")]
+        with pytest.raises(OrderStateUnknown) as info:
+            await broker.market_order("BTCUSDT", LONG, 0.004, 60_000.0)
+        return info.value, ex
+
+    err, ex = run(scenario())
+    assert "kısmen" in str(err) and err.client_id == ex.orders[0]["clientOrderId"]
+    assert len(ex.args("create_order")) == 1
+
+
 def test_fill_falls_back_to_my_trades_when_order_queries_fail():
     async def scenario():
         ex = FakeExchange()
@@ -548,7 +634,7 @@ def test_retries_exhausted_but_verified_not_sent_is_rejected(sleeps):
     err, ex = run(scenario())
     assert err.code == "network"
     assert len(ex.args("create_order")) == 3 and ex.orders == []
-    assert sleeps == [1.0, 2.0]
+    assert sleeps == [1.0, 2.0, 4.0]  # the last one precedes the final "was it sent?" lookup
 
 
 @pytest.mark.parametrize("exc,expected,code", [
@@ -601,6 +687,80 @@ def test_lookup_rejected_after_ambiguous_send_is_state_unknown_not_rejection():
     assert len(ex.args("create_order")) == 1
 
 
+def test_order_invisible_until_after_the_last_timeout_is_found_by_the_final_lookup(monkeypatch):
+    async def scenario():
+        broker, ex = await connected(live_cfg(max_retries=1))
+        delays = []
+
+        async def sleep_then_reveal(seconds):  # the exchange shows the order only after some delay
+            delays.append(seconds)
+            ex.reveal()
+
+        monkeypatch.setattr(bf, "_sleep", sleep_then_reveal)
+        ex.hide_new = True
+        ex.create_effects = [ccxt.RequestTimeout("binanceusdm timed out"),
+                             ("after", ccxt.RequestTimeout("binanceusdm timed out"))]
+        return await broker.market_order("BTCUSDT", LONG, 0.002, 60_000.0), ex, delays
+
+    fill, ex, delays = run(scenario())
+    assert len(ex.orders) == 1 and fill.qty == pytest.approx(0.002) and ex.pos[BTC] == pytest.approx(0.002)
+    assert delays[:2] == [1.0, 2.0]
+
+
+def test_filled_order_missing_from_the_order_query_is_never_sent_twice():
+    async def scenario():
+        broker, ex = await connected()
+        ex.hide_new = True  # executed, but GET /order lags behind the position
+        ex.create_effects = [("after", ccxt.RequestTimeout("binanceusdm timed out"))]
+        with pytest.raises(OrderStateUnknown) as info:
+            await broker.market_order("BTCUSDT", LONG, 0.002, 60_000.0)
+        return info.value, ex
+
+    err, ex = run(scenario())
+    assert len(ex.args("create_order")) == 1 and len(ex.orders) == 1 and ex.pos[BTC] == pytest.approx(0.002)
+    assert "aynı yönde pozisyon" in str(err)
+
+
+def test_codeless_transport_error_after_send_is_looked_up_not_reported_as_rejected(caplog):
+    async def scenario():
+        broker, ex = await connected()
+        # aiohttp.ClientPayloadError while reading the response: ccxt raises a bare ExchangeError
+        ex.create_effects = [("after", ccxt.ExchangeError(
+            f"binanceusdm POST https://demo-fapi.binance.com/fapi/v1/order?signature=abc123 {SECRET}"))]
+        return await broker.market_order("BTCUSDT", LONG, 0.002, 60_000.0), ex
+
+    fill, ex = run(scenario())
+    assert len(ex.args("create_order")) == 1 and len(ex.orders) == 1
+    assert fill.qty == pytest.approx(0.002)
+    assert SECRET not in caplog.text and "abc123" not in caplog.text
+
+
+def test_protection_timeout_after_send_is_not_duplicated():
+    async def scenario():
+        broker, ex = await connected()
+        ex.create_effects = [("after", ccxt.RequestTimeout("binanceusdm POST algoOrder timed out"))]
+        return await broker.place_protection("BTCUSDT", LONG, 0.002, 58_000.0, 62_000.0), ex
+
+    ids, ex = run(scenario())
+    assert [o["type"] for o in ex.algo] == ["stop_market", "take_profit_market"]
+    assert ids == [ex.algo[0]["id"], ex.algo[1]["id"]]
+    sl_cid = ex.args("create_order")[0][5]["clientOrderId"]
+    assert ex.args("fetch_order")[0][2] == {"clientOrderId": sl_cid, "trigger": True}
+    assert len(ex.args("create_order")) == 2
+
+
+def test_cancellation_while_an_order_is_in_flight_is_not_swallowed_or_resent():
+    async def scenario():
+        broker, ex = await connected()
+        ex.create_effects = [asyncio.CancelledError()]
+        with pytest.raises(asyncio.CancelledError):
+            await broker.market_order("BTCUSDT", LONG, 0.002, 60_000.0)
+        return ex
+
+    ex = run(scenario())
+    assert len(ex.args("create_order")) == 1 and "fetch_order" not in ex.names()
+
+
 def test_transient_failure_while_configuring_fails_connect(sleeps):
     ex = FakeExchange()
     ex.leverage_errors[BTC] = ccxt.ExchangeNotAvailable("binanceusdm 502 Bad Gateway")
@@ -614,13 +774,15 @@ def test_transient_failure_while_configuring_fails_connect(sleeps):
 def test_exchange_errors_are_scrubbed_of_secrets():
     async def scenario():
         broker, ex = await connected()
-        ex.create_effects = [ccxt.ExchangeError(f"binanceusdm boom {SECRET} {API_KEY} signature=abcdef0123")]
+        ex.create_effects = [ccxt.ExchangeError(
+            f'binanceusdm {{"code":-1000,"msg":"boom {SECRET} {API_KEY}"}} signature=abcdef0123')]
         with pytest.raises(FuturesError) as info:
             await broker.market_order("BTCUSDT", LONG, 0.002, 60_000.0)
-        return str(info.value)
+        return str(info.value), ex
 
-    text = run(scenario())
+    text, ex = run(scenario())
     assert SECRET not in text and API_KEY not in text and "abcdef0123" not in text
+    assert len(ex.args("create_order")) == 1 and "fetch_order" not in ex.names()
 
 
 # -- closing ------------------------------------------------------------------------------
@@ -657,6 +819,54 @@ def test_close_position_clamps_to_the_exchange_position():
     fill, ex = run(scenario())
     assert [args[3] for args in ex.args("create_order")] == [0.05, 0.02]
     assert fill.qty == pytest.approx(0.02) and fill.side == LONG and ex.pos[ETH] == 0
+
+
+def test_close_position_completes_a_partially_filled_close():
+    async def scenario():
+        broker, ex = await connected()
+        ex.pos[BTC] = 0.004
+        ex.partials = [(0.5, "expired", 59_900.0), (1.0, "closed", 59_800.0)]
+        return await broker.close_position("BTCUSDT", LONG, 0.004, 60_000.0), ex
+
+    fill, ex = run(scenario())
+    sent = ex.args("create_order")
+    assert [(a[2], a[3], a[5]["reduceOnly"]) for a in sent] == [("sell", 0.004, True), ("sell", 0.002, True)]
+    assert ex.pos[BTC] == 0
+    assert fill.qty == pytest.approx(0.004) and fill.side == SHORT
+    assert fill.price == pytest.approx((59_900.0 + 59_800.0) / 2)
+    assert fill.fee == pytest.approx(0.002 * 59_900 * 0.0005 + 0.002 * 59_800 * 0.0005)
+    assert fill.slippage_bps == pytest.approx(-(fill.price / 60_000 - 1) * 1e4)
+
+
+def test_held_symbols_outside_the_tradeable_set_are_manageable_but_not_tradeable():
+    async def scenario():
+        ex = FakeExchange()
+        ex.fill_price["OLD/USDT:USDT"] = 1.0
+        ex.pos = {ETH: 0.5, "OLD/USDT:USDT": -40.0}
+        broker, _ = await connected(live_cfg(symbols=("BTCUSDT", "OLDUSDT")), ex)
+        hidden = await broker.positions()
+        held = await broker.positions(["BTCUSDT", "ETHUSDT", "OLDUSDT", "PAXGUSDT"])
+        codes = []
+        for sym in ("ETHUSDT", "OLDUSDT"):
+            with pytest.raises(OrderRejected) as info:
+                await broker.market_order(sym, LONG, 1.0, 3_000.0)
+            codes.append(info.value.code)
+        ids = await broker.place_protection("ETHUSDT", LONG, 0.5, 2_800.0, None)
+        await broker.cancel_protection("ETHUSDT")
+        eth = await broker.close_position("ETHUSDT", LONG, 0.5, 3_000.0)
+        old = await broker.close_position("OLDUSDT", SHORT, 40.0, 1.0)
+        exit_fill = await broker.last_close_fill("ETHUSDT", 0, LONG)
+        return hidden, held, codes, ids, eth, old, exit_fill, ex
+
+    hidden, held, codes, ids, eth, old, exit_fill, ex = run(scenario())
+    assert hidden == {}
+    assert set(held) == {"ETHUSDT", "OLDUSDT"} and held["OLDUSDT"].side == SHORT
+    assert codes == ["unavailable", "unavailable"]
+    assert len(ids) == 1 and ex.algo == []
+    assert eth.qty == pytest.approx(0.5) and old.qty == pytest.approx(40.0) and old.side == LONG
+    assert all(a[5].get("reduceOnly") for a in ex.args("create_order") if "stopLossPrice" not in a[5])
+    assert ex.pos[ETH] == 0 and ex.pos["OLD/USDT:USDT"] == 0
+    assert exit_fill.qty == pytest.approx(0.5)
 
 
 # -- exchange-side protection -------------------------------------------------------------------
@@ -850,3 +1060,480 @@ def test_real_ccxt_builds_expected_demo_requests_offline():
     assert fill.qty == pytest.approx(0.002) and fill.price == pytest.approx(60_012.3)
     assert fill.fee == pytest.approx(0.04800984)
     assert ids == ["501", "502"]
+
+
+# -- real ccxt over a fake Binance HTTP session --------------------------------------------------------
+# Only aiohttp's session is replaced: the installed ccxt binanceusdm builds, signs and routes every request,
+# maps every Binance error body (handle_errors) and parses every response. Bodies follow Binance's USD-M
+# shapes (fapi v1 order / algoOrder / userTrades, v3 account / positionRisk) and spot /api/v3/account.
+UNSIGNED = {"/fapi/v1/exchangeInfo", "/fapi/v1/time", "/fapi/v1/ticker/24hr"}
+EXCHANGE_INFO = {"timezone": "UTC", "serverTime": 1_700_000_000_000, "futuresType": "U_MARGINED", "rateLimits": [],
+                 "exchangeFilters": [], "assets": [],
+                 "symbols": [*RAW_MARKETS, {**_raw_market("BTCUSDT_261225", "BTC"), "pair": "BTCUSDT",
+                                            "contractType": "CURRENT_QUARTER", "deliveryDate": 1_798_185_600_000}]}
+HOSTS = {"demo": ("demo-fapi.binance.com", "demo-api.binance.com"), "mainnet": ("fapi.binance.com", "api.binance.com")}
+
+
+def _binance_err(status, code, msg):
+    return status, {"code": code, "msg": msg}
+
+
+class _HTTPResponse:
+    def __init__(self, status, payload):
+        self.status, self.reason = status, "OK" if status < 400 else "Bad Request"
+        self.headers = {"Content-Type": "application/json"}
+        self._text = payload if isinstance(payload, str) else json.dumps(payload)
+
+    async def text(self, errors="strict"):
+        return self._text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class BinanceHTTP:
+    """aiohttp-session stand-in answering like Binance USD-M; records (method, host, path, params, headers, raw)."""
+
+    def __init__(self, dual=False):
+        self.headers = {}  # ccxt merges session.headers into every request
+        self.requests = []
+        self.effects = {}  # (method, path) -> [exception | fn(http, params) -> None | (status, body) | exception]
+        self.dual = dual
+        self.margin_reply = None
+        self.lev = {}
+        self.pos, self.entry, self.orders, self.algos, self.trades = {}, {}, {}, {}, []
+        self.px = {"BTCUSDT": "60012.30", "ETHUSDT": "3001.25", "BNBUSDT": "600.110"}
+        self.fee_asset = "USDT"
+        self.open_order_margin = "10.0"
+        self._ids, self._algo_ids = itertools.count(4_000_000_001), itertools.count(1_000_001)
+
+    def get(self, url, data=None, headers=None, **_):
+        return self._call("GET", url, data, headers)
+
+    def post(self, url, data=None, headers=None, **_):
+        return self._call("POST", url, data, headers)
+
+    def delete(self, url, data=None, headers=None, **_):
+        return self._call("DELETE", url, data, headers)
+
+    async def close(self):
+        pass
+
+    def _call(self, method, url, data, headers):
+        parts = urlsplit(str(url))
+        raw = parts.query or (data.decode() if data else "")
+        params = dict(parse_qsl(raw, keep_blank_values=True))
+        self.requests.append({"method": method, "host": parts.netloc, "path": parts.path, "params": params,
+                              "headers": dict(headers or {}), "raw": raw})
+        queue = self.effects.get((method, parts.path))
+        if queue:
+            effect = queue.pop(0)
+            out = effect(self, params) if callable(effect) else effect
+            if isinstance(out, BaseException):
+                raise out
+            if out is not None:
+                return _HTTPResponse(*out)
+        return _HTTPResponse(*self.route(method, parts.path, params))
+
+    def sent(self, method, path):
+        drop = {"timestamp", "signature", "recvWindow"}
+        return [{k: v for k, v in r["params"].items() if k not in drop}
+                for r in self.requests if r["method"] == method and r["path"] == path]
+
+    def landed_then(self, exc):
+        """Effect: the request reaches the matching engine, then the response is lost."""
+        return lambda http, params: (http.route("POST", "/fapi/v1/" + ("algoOrder" if "algoType" in params
+                                                                        else "order"), params), exc)[1]
+
+    def open_order(self, symbol, cid):
+        oid = next(self._ids)
+        self.orders[oid] = {"orderId": oid, "symbol": symbol, "status": "NEW", "clientOrderId": cid, "price": "50000",
+                            "avgPrice": "0", "origQty": "0.002", "executedQty": "0", "cumQuote": "0",
+                            "type": "LIMIT", "side": "BUY", "positionSide": "BOTH", "updateTime": 1}
+        return oid
+
+    def route(self, method, path, p):
+        now = int(time.time() * 1000)
+        if path == "/fapi/v1/exchangeInfo":
+            return 200, EXCHANGE_INFO
+        if path == "/fapi/v1/time":
+            return 200, {"serverTime": now}
+        if path == "/fapi/v1/positionSide/dual":
+            return 200, {"dualSidePosition": self.dual}
+        if path == "/fapi/v1/marginType":
+            return self.margin_reply or (200, {"code": 200, "msg": "success"})
+        if path == "/fapi/v1/leverage":
+            self.lev[p["symbol"]] = int(p["leverage"])
+            return 200, {"leverage": int(p["leverage"]), "maxNotionalValue": "480000000", "symbol": p["symbol"]}
+        if path == "/fapi/v1/leverageBracket":
+            return 200, [{"symbol": s, "brackets": [{"bracket": 1, "initialLeverage": 125, "notionalCap": 50000,
+                                                      "notionalFloor": 0, "maintMarginRatio": 0.004, "cum": 0.0}]}
+                         for s in self.px]
+        if path == "/fapi/v3/account":
+            return 200, {"totalWalletBalance": "1000.0", "availableBalance": "800.0", "positions": [],
+                         "assets": [{"asset": "USDT", "walletBalance": "1000.00000000",
+                                     "unrealizedProfit": "-12.50000000", "marginBalance": "987.50000000",
+                                     "availableBalance": "800.00000000", "maxWithdrawAmount": "800.0",
+                                     "updateTime": 1_700_000_000_000},
+                                    {"asset": "USDC", "walletBalance": "50.0", "unrealizedProfit": "0.0",
+                                     "marginBalance": "50.0", "availableBalance": "50.0", "updateTime": 1}]}
+        if path == "/api/v3/account":
+            return 200, {"canTrade": True, "accountType": "SPOT", "updateTime": now, "permissions": ["SPOT"],
+                         "balances": [{"asset": "BTC", "free": "0.001", "locked": "0.0"},
+                                      {"asset": "USDT", "free": "5.00000000", "locked": "1.00000000"}]}
+        if path == "/fapi/v3/positionRisk":
+            rows = []
+            for sym, amt in self.pos.items():
+                if amt:
+                    entry, mark = float(self.entry[sym]), float(self.px[sym])
+                    notional, im = amt * mark, abs(amt * mark) / self.lev.get(sym, 1)
+                    rows.append({"symbol": sym, "positionSide": "BOTH", "positionAmt": f"{amt:.3f}",
+                                 "entryPrice": f"{entry}", "breakEvenPrice": f"{entry}", "markPrice": f"{mark}",
+                                 "unRealizedProfit": f"{(mark - entry) * amt:.8f}", "liquidationPrice": "0",
+                                 "isolatedMargin": f"{im:.8f}", "notional": f"{notional:.8f}", "marginAsset": "USDT",
+                                 "isolatedWallet": f"{im:.8f}", "positionInitialMargin": f"{im:.8f}",
+                                 "openOrderInitialMargin": self.open_order_margin,
+                                 "initialMargin": f"{im + float(self.open_order_margin):.8f}", "maintMargin": "0.48",
+                                 "adl": 1, "bidNotional": "0", "askNotional": "0", "updateTime": now})
+            rows.append({"symbol": "BNBUSDT", "positionSide": "BOTH", "positionAmt": "0.00", "entryPrice": "0.0",
+                         "markPrice": "600.11", "unRealizedProfit": "0", "notional": "0", "isolatedMargin": "0",
+                         "initialMargin": "0", "updateTime": 0})  # flat rows are filtered out by ccxt
+            return 200, rows
+        if path == "/fapi/v1/order":
+            return self._order(method, p, now)
+        if path == "/fapi/v1/algoOrder":
+            return self._algo(method, p, now)
+        if path == "/fapi/v1/algoOpenOrders" and method == "DELETE":
+            for a in self.algos.values():
+                if a["symbol"] == p["symbol"] and a["algoStatus"] == "NEW":
+                    a["algoStatus"] = "CANCELED"
+            return 200, {"code": 200, "msg": "The operation of cancel all open order is done."}
+        if path == "/fapi/v1/openOrders":
+            return 200, [o for o in self.orders.values() if o["symbol"] == p["symbol"] and o["status"] == "NEW"]
+        if path == "/fapi/v1/userTrades":
+            return 200, [t for t in self.trades if t["symbol"] == p["symbol"]
+                         and str(t["orderId"]) == p.get("orderId", str(t["orderId"]))
+                         and t["time"] >= int(p.get("startTime", 0))]
+        if path == "/fapi/v1/ticker/24hr":
+            last = self.px[p["symbol"]]
+            return 200, {"symbol": p["symbol"], "lastPrice": last, "openPrice": last, "highPrice": last,
+                         "lowPrice": last, "volume": "1", "quoteVolume": last, "closeTime": now}
+        raise AssertionError(f"unexpected Binance request {method} {path} {p}")
+
+    def _order(self, method, p, now):
+        if method == "GET":
+            key = "clientOrderId" if "origClientOrderId" in p else "orderId"
+            hits = [o for o in self.orders.values() if str(o[key]) == p.get("origClientOrderId", p.get("orderId"))]
+            return (200, hits[0]) if hits else _binance_err(400, -2013, "Order does not exist.")
+        if method == "DELETE":
+            o = self.orders.get(int(p["orderId"]))
+            if o is None or o["status"] != "NEW":
+                return _binance_err(400, -2011, "Unknown order sent.")
+            o["status"] = "CANCELED"
+            return 200, o
+        sym, side, qty = p["symbol"], p["side"], float(p["quantity"])
+        sign, cur = (1 if side == "BUY" else -1), self.pos.get(sym, 0.0)
+        if p.get("reduceOnly") == "true" and (cur == 0 or cur * sign > 0 or qty > abs(cur) + 1e-12):
+            return _binance_err(400, -2022, "ReduceOnly Order is rejected.")
+        oid, px = next(self._ids), self.px[sym]
+        o = {"orderId": oid, "symbol": sym, "status": "FILLED", "clientOrderId": p["newClientOrderId"],
+             "price": "0.00", "avgPrice": px, "origQty": p["quantity"], "executedQty": p["quantity"],
+             "cumQty": p["quantity"], "cumQuote": f"{qty * float(px):.5f}", "timeInForce": "GTC", "type": "MARKET",
+             "reduceOnly": p.get("reduceOnly") == "true", "closePosition": False, "side": side,
+             "positionSide": "BOTH", "stopPrice": "0.00", "workingType": "CONTRACT_PRICE", "priceProtect": False,
+             "origType": "MARKET", "priceMatch": "NONE", "selfTradePreventionMode": "EXPIRE_MAKER",
+             "goodTillDate": 0, "updateTime": now}
+        self.orders[oid] = o
+        self.pos[sym] = round(cur + sign * qty, 9)
+        self.entry.setdefault(sym, px)
+        fee = qty * float(px) * 0.0005 / (float(self.px["BNBUSDT"]) if self.fee_asset == "BNB" else 1.0)
+        self.trades.append({"symbol": sym, "id": len(self.trades) + 1, "orderId": oid, "side": side, "price": px,
+                            "qty": p["quantity"], "realizedPnl": "0", "quoteQty": o["cumQuote"],
+                            "commission": f"{fee:.8f}", "commissionAsset": self.fee_asset, "time": now,
+                            "buyer": side == "BUY", "maker": False, "positionSide": "BOTH"})
+        return 200, o
+
+    def _algo(self, method, p, now):
+        if method == "GET":
+            key = "clientAlgoId" if "clientAlgoId" in p else "algoId"
+            hits = [a for a in self.algos.values() if str(a[key]) == p[key]]
+            return (200, hits[0]) if hits else _binance_err(400, -2013, "Order does not exist.")
+        if method == "DELETE":
+            a = self.algos.get(int(p["algoId"]))
+            if a is None or a["algoStatus"] != "NEW":
+                return _binance_err(400, -20124, "Invalid algo id or it has been completed.")
+            a["algoStatus"] = "CANCELED"
+            return 200, {"algoId": a["algoId"], "clientAlgoId": a["clientAlgoId"], "code": "200", "msg": "success"}
+        aid = next(self._algo_ids)
+        self.algos[aid] = {"algoId": aid, "clientAlgoId": p["clientAlgoId"], "algoType": p["algoType"],
+                           "orderType": p["type"], "symbol": p["symbol"], "side": p["side"], "positionSide": "BOTH",
+                           "timeInForce": "GTC", "quantity": p["quantity"], "algoStatus": "NEW",
+                           "triggerPrice": p["triggerPrice"], "price": "0.00", "workingType": p["workingType"],
+                           "priceMatch": "NONE", "closePosition": False, "priceProtect": False,
+                           "reduceOnly": p.get("reduceOnly") == "true", "createTime": now, "updateTime": now,
+                           "triggerTime": 0, "goodTillDate": 0}
+        return 200, self.algos[aid]
+
+
+def _real_client(cfg, http):
+    ex = bf.build_exchange(cfg)
+    ex.session, ex.own_session, ex.enableRateLimit = http, False, False
+    ex.timeout_on_exit = 0  # close() waits for aiohttp's sockets; there are none here
+    return ex
+
+
+async def _real_broker(cfg, http):
+    broker = BinanceFuturesBroker(cfg, _real_client(cfg, http))
+    try:
+        await broker.connect()
+    except BaseException:
+        await broker.close()
+        raise
+    return broker
+
+
+def _signed_ok(http):
+    signed = [r for r in http.requests if r["path"] not in UNSIGNED]
+    assert signed and all({"timestamp", "signature"} <= set(r["params"]) and r["params"]["recvWindow"] == "5000"
+                          and r["headers"].get("X-MBX-APIKEY") == API_KEY for r in signed)
+    assert all(SECRET not in r["raw"] and SECRET not in str(r["headers"]) for r in http.requests)
+
+
+@pytest.mark.parametrize("env", ["demo", "mainnet"])
+def test_real_ccxt_requests_go_to_the_env_hosts_with_binance_params(env):
+    cfg = live_cfg(env, symbols=("BTCUSDT", "ETHUSDT", "BNBUSDT", "OLDUSDT"), leverage=3, margin_mode="isolated")
+    http = BinanceHTTP()
+    since = int(time.time() * 1000) - 60_000
+
+    async def scenario():
+        broker = await _real_broker(cfg, http)
+        try:
+            out = {"bal": await broker.balance(), "spot": await broker.spot_usdt_balance()}
+            out["open"] = await broker.market_order("BTCUSDT", LONG, 0.0029999, 60_000.0)
+            out["ids"] = await broker.place_protection("BTCUSDT", LONG, out["open"].qty, 58_950.04, 62_000.06)
+            await broker.cancel_protection("BTCUSDT", out["ids"])
+            http.fee_asset = "BNB"
+            out["short"] = await broker.market_order("ETHUSDT", SHORT, 0.05, 3_000.0)
+            http.px["ETHUSDT"] = "2950.00"
+            out["pos"] = await broker.positions()
+            out["short_ids"] = await broker.place_protection("ETHUSDT", SHORT, 0.05, 3_100.123, 2_900.456,
+                                                             "CONTRACT_PRICE")
+            await broker.place_protection("BTCUSDT", LONG, out["open"].qty, 58_950.04)
+            out["bot_oid"] = http.open_order("BTCUSDT", CLIENT_ID_PREFIX + "o-left")
+            out["manual_oid"] = http.open_order("BTCUSDT", "web_manual_order")
+            await broker.cancel_protection("BTCUSDT")
+            out["close"] = await broker.close_position("BTCUSDT", LONG, out["open"].qty, 60_100.0)
+            out["again"] = await broker.close_position("BTCUSDT", LONG, out["open"].qty, 60_100.0)
+            out["exit"] = await broker.last_close_fill("BTCUSDT", since, LONG)
+            return broker, out
+        finally:
+            await broker.close()
+
+    broker, out = run(scenario())
+    fapi_host, spot_host = HOSTS[env]
+    # (1) every futures call on the env's fapi host, the spot balance on the env's spot host
+    assert all(r["host"] == fapi_host for r in http.requests if r["path"].startswith("/fapi/"))
+    assert [(r["host"], r["path"]) for r in http.requests if not r["path"].startswith("/fapi/")] == \
+        [(spot_host, "/api/v3/account")]
+    _signed_ok(http)
+    # connect: markets, clock, one-way check, margin type + leverage per tradeable perpetual only
+    assert [(r["method"], r["path"]) for r in http.requests[:3]] == [
+        ("GET", "/fapi/v1/exchangeInfo"), ("GET", "/fapi/v1/time"), ("GET", "/fapi/v1/positionSide/dual")]
+    assert http.sent("POST", "/fapi/v1/marginType") == [{"symbol": s, "marginType": "ISOLATED"}
+                                                        for s in ("BTCUSDT", "ETHUSDT", "BNBUSDT")]
+    assert http.sent("POST", "/fapi/v1/leverage") == [{"symbol": s, "leverage": "3"}
+                                                      for s in ("BTCUSDT", "ETHUSDT", "BNBUSDT")]
+    assert set(broker.unavailable) == {"OLDUSDT"}
+    # (7) balances
+    assert out["bal"] == FuturesBalance(wallet=1000.0, available=800.0, unrealized=-12.5, equity=987.5)
+    assert http.sent("GET", "/fapi/v3/account") == [{}] and out["spot"] == pytest.approx(6.0)
+    # (2) MARKET open and (3) reduce-only close on /fapi/v1/order, quantity truncated to the step
+    orders = http.sent("POST", "/fapi/v1/order")
+    opens = [o for o in orders if o["newClientOrderId"].startswith(CLIENT_ID_PREFIX + "o-")]
+    assert opens[0] == {"symbol": "BTCUSDT", "side": "BUY", "type": "MARKET", "quantity": "0.002",
+                        "newOrderRespType": "RESULT", "newClientOrderId": opens[0]["newClientOrderId"]}
+    assert opens[1] == {**opens[0], "symbol": "ETHUSDT", "side": "SELL", "quantity": "0.05",
+                        "newClientOrderId": opens[1]["newClientOrderId"]}
+    closes = [o for o in orders if o["newClientOrderId"].startswith(CLIENT_ID_PREFIX + "c-")]
+    assert len(closes) == 2 and closes[0] == {**opens[0], "side": "SELL", "reduceOnly": "true",
+                                              "newClientOrderId": closes[0]["newClientOrderId"]}
+    assert out["close"].qty == pytest.approx(0.002) and out["close"].side == SHORT
+    assert out["again"] is None  # -2022 through ccxt's error mapping, then positionRisk shows nothing left
+    assert http.sent("GET", "/fapi/v1/userTrades")[0] == {"symbol": "BTCUSDT", "orderId": "4000000001"}
+    assert out["open"].fee == pytest.approx(0.002 * 60_012.3 * 0.0005)
+    assert out["short"].fee == pytest.approx(0.05 * 3_001.25 * 0.0005, rel=1e-5)  # BNB fee at BNB/USDT:USDT
+    assert {"symbol": "BNBUSDT"} in http.sent("GET", "/fapi/v1/ticker/24hr")
+    # (7) positionRisk v3: one-way positionAmt sign, unRealizedProfit, leverage without open-order margin
+    assert {"symbol": "BTCUSDT"} not in http.sent("GET", "/fapi/v3/positionRisk")
+    assert out["pos"] == {
+        "BTCUSDT": ExchangePosition("BTCUSDT", LONG, 0.002, 60_012.3, 0.0, 3.0),
+        "ETHUSDT": ExchangePosition("ETHUSDT", SHORT, 0.05, 3_001.25, pytest.approx(2.5625), 3.0)}
+    # (4) protection on the algo-order API: STOP_MARKET / TAKE_PROFIT_MARKET, reduce-only qty, tick-rounded trigger
+    algo = http.sent("POST", "/fapi/v1/algoOrder")
+    base = {"algoType": "CONDITIONAL", "symbol": "BTCUSDT", "side": "SELL", "quantity": "0.002", "reduceOnly": "true",
+            "workingType": "MARK_PRICE", "newOrderRespType": "RESULT"}
+    assert algo[0] == {**base, "type": "STOP_MARKET", "triggerPrice": "58950", "clientAlgoId": algo[0]["clientAlgoId"]}
+    assert algo[1] == {**base, "type": "TAKE_PROFIT_MARKET", "triggerPrice": "62000.1",
+                       "clientAlgoId": algo[1]["clientAlgoId"]}
+    short_base = {**base, "symbol": "ETHUSDT", "side": "BUY", "quantity": "0.05", "workingType": "CONTRACT_PRICE"}
+    assert algo[2] == {**short_base, "type": "STOP_MARKET", "triggerPrice": "3100.12",  # short stop above entry
+                       "clientAlgoId": algo[2]["clientAlgoId"]}
+    assert algo[3] == {**short_base, "type": "TAKE_PROFIT_MARKET", "triggerPrice": "2900.46",
+                       "clientAlgoId": algo[3]["clientAlgoId"]}
+    assert [a["clientAlgoId"][:9] for a in algo] == ["cappa-sl-", "cappa-tp-", "cappa-sl-", "cappa-tp-", "cappa-sl-"]
+    assert all(o["type"] == "MARKET" for o in orders)  # no conditional order on the legacy endpoint
+    assert out["ids"] == ["1000001", "1000002"] and out["short_ids"] == ["1000003", "1000004"]
+    # (5) cancel: by algoId, or all algo orders of the symbol plus only the bot's regular open orders
+    assert http.sent("DELETE", "/fapi/v1/algoOrder") == [{"symbol": "BTCUSDT", "algoId": i} for i in out["ids"]]
+    assert http.sent("DELETE", "/fapi/v1/algoOpenOrders") == [{"symbol": "BTCUSDT"}]
+    assert http.sent("GET", "/fapi/v1/openOrders") == [{"symbol": "BTCUSDT"}]
+    assert http.sent("DELETE", "/fapi/v1/order") == [{"symbol": "BTCUSDT", "orderId": str(out["bot_oid"])}]
+    assert http.orders[out["manual_oid"]]["status"] == "NEW" and http.algos[1_000_005]["algoStatus"] == "CANCELED"
+    # last_close_fill: userTrades from the entry time, at most 1000 rows, no endTime (inside the 7-day window)
+    assert http.sent("GET", "/fapi/v1/userTrades")[-1] == {"symbol": "BTCUSDT", "startTime": str(since),
+                                                           "limit": "1000"}
+    assert out["exit"].side == SHORT and out["exit"].qty == pytest.approx(0.002)
+
+
+@pytest.mark.parametrize("env", ["demo", "mainnet"])
+def test_real_ccxt_ambiguous_sends_are_looked_up_by_client_id(env):
+    cfg = live_cfg(env, symbols=("BTCUSDT",))
+    http = BinanceHTTP()
+    order, algo = ("POST", "/fapi/v1/order"), ("POST", "/fapi/v1/algoOrder")
+
+    async def scenario():
+        broker = await _real_broker(cfg, http)
+        try:
+            http.effects[order] = [http.landed_then(asyncio.TimeoutError())]  # -> ccxt RequestTimeout
+            first = await broker.market_order("BTCUSDT", LONG, 0.002, 60_000.0)
+            http.effects[order] = [lambda h, p: (h.route(*order, p), _binance_err(
+                408, -1007, "Timeout waiting for response from backend server. Send status unknown; "
+                            "execution status unknown."))[1]]
+            second = await broker.market_order("BTCUSDT", LONG, 0.002, 60_000.0)
+            http.effects[algo] = [http.landed_then(asyncio.TimeoutError())]
+            landed = await broker.place_protection("BTCUSDT", LONG, 0.004, 58_000.0)
+            http.effects[algo] = [asyncio.TimeoutError()]  # lost before reaching Binance
+            resent = await broker.place_protection("BTCUSDT", LONG, 0.004, 58_000.0)
+            http.effects[order] = [_binance_err(400, -1021, "Timestamp for this request is outside of the "
+                                                            "recvWindow.")]
+            third = await broker.market_order("BTCUSDT", SHORT, 0.004, 60_000.0, reduce_only=True)
+            return first, second, landed, resent, third
+        finally:
+            await broker.close()
+
+    first, second, landed, resent, third = run(scenario())
+    assert all(r["host"] == HOSTS[env][0] for r in http.requests)
+    sent = http.sent(*order)
+    cids = [o["newClientOrderId"] for o in sent]
+    assert cids[:2] == [first_cid := cids[0], cids[1]] and len(set(cids[:2])) == 2  # each landed order sent once
+    assert http.sent("GET", "/fapi/v1/order") == [{"symbol": "BTCUSDT", "origClientOrderId": cids[0]},
+                                                  {"symbol": "BTCUSDT", "origClientOrderId": cids[1]},
+                                                  {"symbol": "BTCUSDT", "origClientOrderId": cids[2]}]
+    assert first_cid.startswith(CLIENT_ID_PREFIX) and first.qty == second.qty == pytest.approx(0.002)
+    algo_sent = [a["clientAlgoId"] for a in http.sent(*algo)]
+    assert algo_sent == [algo_sent[0], algo_sent[1], algo_sent[1]]  # landed once; lost one re-sent with its id
+    assert http.sent("GET", "/fapi/v1/algoOrder") == [{"symbol": "BTCUSDT", "clientAlgoId": i}
+                                                      for i in algo_sent[:2]]
+    assert landed == ["1000001"] and resent == ["1000002"] and len(http.algos) == 2
+    # -1021 (rejected, clock drift): resync from the fapi clock, then the same client id is sent again
+    assert cids[2] == cids[3] and ("GET", "/fapi/v1/time") in [(r["method"], r["path"]) for r in http.requests[3:]]
+    assert third.qty == pytest.approx(0.004) and http.pos["BTCUSDT"] == 0
+
+
+@pytest.mark.parametrize("env", ["demo", "mainnet"])
+def test_real_ccxt_binance_error_bodies_map_to_broker_outcomes(env):
+    def cfg():
+        return live_cfg(env, symbols=("BTCUSDT", "ETHUSDT"), margin_mode="isolated")
+
+    async def connect_with(**attrs):
+        http = BinanceHTTP()
+        for key, value in attrs.items():
+            setattr(http, key, value)
+        try:
+            broker = await _real_broker(cfg(), http)
+        except FuturesError as e:
+            return http, e
+        await broker.close()
+        return http, broker
+
+    async def order_with(path, reply, call):
+        http = BinanceHTTP()
+        broker = await _real_broker(cfg(), http)
+        try:
+            await broker.market_order("BTCUSDT", LONG, 0.002, 60_000.0)
+            if reply is not None:
+                http.effects[("POST", path)] = [reply]
+            n = len(http.requests)
+            try:
+                return http, await call(broker), http.requests[n:]
+            except FuturesError as e:
+                return http, e, http.requests[n:]
+        finally:
+            await broker.close()
+
+    async def scenario():
+        out = {}
+        for name, reply in {"exact": _binance_err(400, -4046, "No need to change margin type."),
+                            "variant": _binance_err(400, -4046, "No need to change margin type"),
+                            "has_position": _binance_err(400, -4048, "Margin type cannot be changed if there "
+                                                                     "exists position."),
+                            "multi_assets": _binance_err(400, -4168, "Unable to adjust to isolated-margin mode "
+                                                                     "under the Multi-Assets mode.")}.items():
+            out[name] = await connect_with(margin_reply=reply)
+        out["hedge"] = await connect_with(dual=True)
+        out["auth"] = await connect_with(effects={("GET", "/fapi/v1/positionSide/dual"): [
+            _binance_err(401, -2015, "Invalid API-key, IP, or permissions for action.")]})
+        out["margin"] = await order_with("/fapi/v1/order", _binance_err(400, -2019, "Margin is insufficient."),
+                                         lambda b: b.market_order("BTCUSDT", LONG, 0.002, 60_000.0))
+        for code, text in ((-2021, "Order would immediately trigger."),
+                           (-4142, "REJECT: take profit or stop order will be triggered immediately.")):
+            out[code] = await order_with("/fapi/v1/algoOrder", _binance_err(400, code, text),
+                                         lambda b: b.place_protection("BTCUSDT", LONG, 0.002, 61_000.0))
+        out["gone"] = await order_with("/fapi/v1/algoOrder", None,  # DELETE of an unknown/finished algo order
+                                       lambda b: b.cancel_protection("BTCUSDT", ["1000999"]))
+        return out
+
+    out = run(scenario())
+    for name in ("exact", "variant", "has_position"):
+        http, broker = out[name]
+        assert broker.symbol_map == {"BTCUSDT": BTC, "ETHUSDT": ETH}
+        assert len(http.sent("POST", "/fapi/v1/leverage")) == 2
+    assert out["exact"][1].warnings == out["variant"][1].warnings == []
+    assert any("marjin modu" in w for w in out["has_position"][1].warnings)
+    assert isinstance(out["multi_assets"][1], LiveTradingRefused) and "Multi-Assets" in str(out["multi_assets"][1])
+    assert isinstance(out["hedge"][1], LiveTradingRefused) and str(out["hedge"][1]) == bf.HEDGE_MODE_MESSAGE
+    http, refused = out["auth"]
+    assert isinstance(refused, LiveTradingRefused) and len(http.sent("GET", "/fapi/v1/positionSide/dual")) == 1
+    http, rejected, reqs = out["margin"]
+    assert isinstance(rejected, OrderRejected) and rejected.code == "insufficient_funds"
+    assert [(r["method"], r["path"]) for r in reqs] == [("POST", "/fapi/v1/order")]  # never retried or looked up
+    for code in (-2021, -4142):
+        http, rejected, reqs = out[code]
+        assert isinstance(rejected, OrderRejected) and rejected.code == "would_trigger"
+        assert [(r["method"], r["path"]) for r in reqs] == [("POST", "/fapi/v1/algoOrder")]
+    http, result, reqs = out["gone"]
+    assert result is None and [(r["method"], r["path"], r["params"]["algoId"]) for r in reqs] == [
+        ("DELETE", "/fapi/v1/algoOrder", "1000999")]  # -20124 (already triggered or cancelled) is ignored
+    assert all(r["host"] == HOSTS[env][0] for _, v in out.items() for r in v[0].requests)
+
+
+def test_real_ccxt_paper_mode_balance_reads_the_mainnet_account_read_only():
+    cfg = Config()  # paper mode; live.env "demo" must not matter here
+    cfg.account.balance_source = "binance"
+    cfg.secrets = Secrets(binance_api_key=API_KEY, binance_secret_key=SECRET)
+    out = {}
+    for wallet in ("futures", "spot"):
+        cfg.account.binance_wallet = wallet
+        http = BinanceHTTP()
+        out[wallet] = (run(fetch_binance_balance(cfg, _real_client(cfg, http))), http)
+    assert out["futures"][0] == pytest.approx(987.5) and out["spot"][0] == pytest.approx(6.0)
+    for wallet, account in (("futures", ("fapi.binance.com", "/fapi/v3/account")),
+                            ("spot", ("api.binance.com", "/api/v3/account"))):
+        http = out[wallet][1]
+        assert [(r["host"], r["path"]) for r in http.requests] == [
+            ("fapi.binance.com", "/fapi/v1/exchangeInfo"), ("fapi.binance.com", "/fapi/v1/time"), account]
+        assert all(r["method"] == "GET" for r in http.requests)
+        _signed_ok(http)

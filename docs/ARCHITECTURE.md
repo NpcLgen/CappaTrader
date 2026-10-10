@@ -53,10 +53,11 @@ hesap veya Binance USD-M futures'tur.
 ## Bir bar kapandığında (canlı)
 
 1. `kline` mesajı `x=true` ile gelir → `LiveEngine.on_kline` barı ekler, eksik bar varsa REST ile tamamlar, temizler.
-2. Online HMM ve GARCH (ensemble'da ayrıca ML) `retrain_every` barda bir yeniden eğitilir (thread'de); son bar için
-   HMM durumu ileri filtrelemeyle, GARCH tahmini özyinelemeyle hesaplanır.
+2. Online HMM ve GARCH (ensemble'da ayrıca ML) backtest'le aynı barlarda yeniden eğitilir. Yeniden eğitim takvimi
+   zamana sabitlidir (`zaman damgası // (bar × retrain_every)`). Eğitim, puanlanan bardan önceki barlarla ve bir
+   thread'de yapılır. Son bar için HMM durumu ileri filtrelemeyle, GARCH tahmini özyinelemeyle hesaplanır.
 3. Emir defteri + işlem akışından `orderflow`, funding/F&G/haberden `sentiment` skoru alınır.
-4. `prepare_universe` (sembol + pairs ortakları) → `DecisionEngine.evaluate`.
+4. `prepare_universe` (sembol + pairs ortakları) → `strategy/factory.decide` (Squeeze/VWAP veya ensemble).
 5. Giriş onaylanırsa `size_position` → kağıt hesapta `PaperBroker.market_order` (gecikme kadar bekler, defterde
    yürür); canlıda bakiye Binance'ten okunur, `BinanceFuturesBroker.market_order` gerçek emri gönderir ve borsaya
    STOP_MARKET + TAKE_PROFIT_MARKET girilir → `Account.open_position` → SQLite → Telegram.
@@ -73,6 +74,10 @@ hesap veya Binance USD-M futures'tur.
 - HMM t barındaki durumu yalnızca 1..t gözlemlerinden ileri filtrelemeyle bulur (Viterbi / smoothing geleceği görür,
   kullanılmaz); model t'den önceki verilerle eğitilmiştir. GARCH t barında t+1 için tahmin üretir.
   `test_ml_walk_forward_has_no_lookahead` geleceği bozup geçmiş tahminlerin aynı kaldığını doğrular.
+- Yeniden eğitim barları zamana sabitlendiği ve HMM özellikleri her pencerede ayrı (kayan toplam olmadan)
+  hesaplandığı için sonuç, verinin nerede başladığına bağlı değildir. Böylece ortada başlatılan canlı bir çalışma
+  backtest'in rejim ve GARCH değerlerini bit düzeyinde aynen üretir
+  (`tests/test_hmm_garch.py::test_live_loop_matches_walk_forward_on_every_bar`).
 - Backtest kararı t kapanışında verir, t+1 açılışında (+ isteğe bağlı gecikme barı) maliyetlerle doldurur. Stoplar barın
   high/low aralığına göre, açılışta boşluk varsa açılış fiyatından tetiklenir; izleyen stop ancak bir sonraki bardan geçerlidir.
 

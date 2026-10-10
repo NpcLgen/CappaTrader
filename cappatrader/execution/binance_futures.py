@@ -21,6 +21,7 @@ import logging
 import math
 import re
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -134,6 +135,13 @@ def _is_clock_error(exc: BaseException) -> bool:
     return isinstance(exc, ccxt.InvalidNonce) or _has_code(exc, -1021, -5028)
 
 
+def _maybe_executed(exc: BaseException) -> bool:
+    """create_order failed but the order may have reached the matching engine: transient errors, and
+    transport failures ccxt reports as a bare ExchangeError without a Binance error code (an
+    aiohttp.ClientPayloadError while the response was being read)."""
+    return _is_transient(exc) or (type(exc) is ccxt.ExchangeError and not _codes(exc))
+
+
 def _no_change(exc: BaseException) -> bool:
     return (isinstance(exc, ccxt.NoChange) or _has_code(exc, -4046, -4059)
             or "no need to change" in str(exc).lower())
@@ -226,6 +234,16 @@ def _timestamp(ms: Any) -> pd.Timestamp:
     return pd.Timestamp(int(ms), unit="ms", tz="UTC")
 
 
+def _merge_fills(a: Fill, b: Fill) -> Fill:
+    """Two fills of the same side as one: summed qty and fees, qty-weighted average price."""
+    qty = a.qty + b.qty
+    price = (a.qty * a.price + b.qty * b.price) / qty
+    slippage = a.side * (price / a.ref_price - 1) * 1e4 if a.ref_price > 0 else 0.0
+    return Fill(symbol=a.symbol, side=a.side, qty=float(f"{qty:.12g}"), price=price, ref_price=a.ref_price,
+                fee=a.fee + b.fee, slippage_bps=slippage, latency_ms=a.latency_ms + b.latency_ms,
+                timestamp=b.timestamp)
+
+
 class BinanceAccountReader:
     """Read-only USDT balances (futures and spot). Needs only read permission, works in any mode."""
 
@@ -254,16 +272,17 @@ class BinanceAccountReader:
         return self.ex
 
     def _check_endpoint(self) -> None:
+        """Every API base URL must match the env (fapi v1/v2/v3, the algo-order endpoints and spot alike)."""
         urls = getattr(self.ex, "urls", None)
         api = urls.get("api") if isinstance(urls, dict) else None
-        fapi = api.get("fapiPrivate") if isinstance(api, dict) else None
-        if not isinstance(fapi, str):
+        bases = [u for u in api.values() if isinstance(u, str)] if isinstance(api, dict) else []
+        if not bases:
             return
-        is_demo = "demo-fapi" in fapi or "testnet" in fapi
-        if self.env == "demo" and not is_demo:
+        demo = ["demo-" in u or "testnet" in u for u in bases]
+        if self.env == "demo" and not all(demo):
             raise LiveTradingRefused("live.env=demo ama ccxt istemcisi gerçek (mainnet) uç noktasına bağlı; "
                                      "güvenlik için işlem yapılmıyor.")
-        if self.env == "mainnet" and is_demo:
+        if self.env == "mainnet" and any(demo):
             raise LiveTradingRefused("live.env=mainnet ama ccxt istemcisi demo/testnet uç noktasına bağlı.")
 
     def _secrets(self) -> tuple[str, ...]:
@@ -358,6 +377,9 @@ class BinanceFuturesBroker(BinanceAccountReader):
         self._assert_allowed(cfg)
         super().__init__(cfg, exchange, cfg.live.env)
         self.symbol_map: dict[str, str] = {}
+        # Held positions outside the tradeable set (removed from the config, or unavailable at connect):
+        # close, protection and exit lookup work for them, new entries do not. Filled by positions(symbols).
+        self.tracked: dict[str, str] = {}
         self.unavailable: dict[str, str] = {}
         self.leverage: dict[str, float] = {}
         self.warnings: list[str] = []
@@ -401,10 +423,15 @@ class BinanceFuturesBroker(BinanceAccountReader):
         self.connected = True
         log.info("Binance USD-M (%s) bağlandı: %s", self.env, ", ".join(self.symbol_map.values()))
 
+    def _perpetuals(self) -> dict[str, dict]:
+        """Loaded USD-M perpetual markets settled in the quote asset, keyed by raw id ("BTCUSDT")."""
+        return {m["id"]: m for m in (getattr(self.ex, "markets", None) or {}).values()
+                if m.get("swap") and m.get("linear") and m.get("settle") == self.quote}
+
     def _map_symbols(self) -> None:
-        by_id = {m["id"]: m for m in (getattr(self.ex, "markets", None) or {}).values()
-                 if m.get("swap") and m.get("linear") and m.get("settle") == self.quote}
+        by_id = self._perpetuals()
         self.symbol_map.clear()
+        self.tracked.clear()
         self.unavailable.clear()
         for raw in self.cfg.symbols:
             market = by_id.get(raw)
@@ -466,9 +493,11 @@ class BinanceFuturesBroker(BinanceAccountReader):
             return False
 
     # -- helpers ---------------------------------------------------------------------
-    def _unified(self, symbol: str) -> str:
+    def _unified(self, symbol: str, opening: bool = False) -> str:
         if symbol in self.symbol_map:
             return self.symbol_map[symbol]
+        if not opening and symbol in self.tracked:
+            return self.tracked[symbol]
         if symbol in self.unavailable:
             raise OrderRejected(f"{fmt.pair(symbol)}: {self.unavailable[symbol]}", "unavailable")
         if not self.connected:
@@ -476,7 +505,14 @@ class BinanceFuturesBroker(BinanceAccountReader):
         raise OrderRejected(f"{fmt.pair(symbol)} yapılandırılmış semboller arasında değil.", "unavailable")
 
     def _raw(self, usym: str) -> str | None:
-        return next((raw for raw, u in self.symbol_map.items() if u == usym), None)
+        return next((raw for raw, u in (*self.symbol_map.items(), *self.tracked.items()) if u == usym), None)
+
+    def _track(self, raw: str) -> None:
+        if raw in self.symbol_map or raw in self.tracked:
+            return
+        market = self._perpetuals().get(raw)  # inactive (settling) markets too: closing must still work
+        if market is not None:
+            self.tracked[raw] = market["symbol"]
 
     def _new_client_id(self, symbol: str, side: int, tag: str) -> str:
         self._seq += 1
@@ -552,8 +588,10 @@ class BinanceFuturesBroker(BinanceAccountReader):
                       params: dict[str, Any], cid: str, conditional: bool = False) -> dict:
         """create_order with idempotent retries: after any ambiguous failure, look up `cid` first."""
         self._assert_allowed(self.cfg)
+        self._check_endpoint()
         raw = self._raw(usym) or usym
         retries = max(0, int(self.cfg.live.max_retries))
+        opening = not conditional and not params.get("reduceOnly")
         maybe_sent = False
         for attempt in range(retries + 1):
             if attempt:
@@ -566,16 +604,20 @@ class BinanceFuturesBroker(BinanceAccountReader):
                         raise OrderStateUnknown(f"{fmt.pair(raw)}: emir {cid} durumu sorgulanamadı; pozisyonu "
                                                 f"Binance'te kontrol edin ({_scrub(str(e), self._secrets())})",
                                                 cid) from e
+                    if _is_clock_error(e):
+                        await self._resync_clock()
                     log.warning("%s: emir %s sorgulanamadı, tekrar gönderilmeden beklenecek: %s",
                                 fmt.pair(raw), cid, _scrub(str(e), self._secrets()))
                     continue
                 if found is not None:
                     log.warning("%s: emir %s borsaya ulaşmış, tekrar gönderilmiyor", fmt.pair(raw), cid)
                     return found
+                if opening:
+                    await self._refuse_resend_if_exposed(usym, side, cid, raw)
             try:
                 return await self.ex.create_order(usym, otype, side, amount, price, dict(params))
             except ccxt.BaseError as e:
-                if not _is_transient(e):
+                if not _maybe_executed(e):
                     if maybe_sent:  # e.g. duplicate client id or margin used up: an earlier send may have landed
                         found = await self._lookup_or_unknown(usym, cid, conditional, raw)
                         if found is not None:
@@ -586,11 +628,29 @@ class BinanceFuturesBroker(BinanceAccountReader):
                 maybe_sent = True
                 log.warning("%s: emir %s için geçici/belirsiz hata (deneme %d/%d): %s", fmt.pair(raw), cid,
                             attempt + 1, retries + 1, _scrub(str(e), self._secrets()))
+        await _sleep(_backoff(retries))  # give a late order time to become visible before declaring it unsent
         found = await self._lookup_or_unknown(usym, cid, conditional, raw)
         if found is not None:
             return found
+        if opening:
+            await self._refuse_resend_if_exposed(usym, side, cid, raw)
         raise OrderRejected(f"{fmt.pair(raw)}: Binance'e {retries + 1} denemede ulaşılamadı; emrin iletilmediği "
                             f"doğrulandı ({cid})", "network")
+
+    async def _refuse_resend_if_exposed(self, usym: str, side: str, cid: str, raw: str) -> None:
+        """Second guard before re-sending an opening order the lookup did not find: Binance only rejects a
+        duplicate client id among OPEN orders, so a filled first send that the order query does not show
+        yet would be executed twice. A position already open in the order's direction means: do not resend."""
+        try:
+            amount = await self._signed_amount(usym)
+        except ccxt.BaseError as e:
+            raise OrderStateUnknown(f"{fmt.pair(raw)}: emir {cid} bulunamadı ve pozisyon doğrulanamadı; tekrar "
+                                    f"gönderilmedi, pozisyonu Binance'te kontrol edin "
+                                    f"({_scrub(str(e), self._secrets())})", cid) from e
+        if amount > 0 if side == "buy" else amount < 0:
+            raise OrderStateUnknown(f"{fmt.pair(raw)}: emir {cid} sorguda görünmüyor ama borsada aynı yönde "
+                                    f"pozisyon var ({fmt.qty(abs(amount))}); çift pozisyon riskine karşı tekrar "
+                                    "gönderilmedi, pozisyonu Binance'te kontrol edin", cid)
 
     async def _lookup_or_unknown(self, usym: str, cid: str, conditional: bool, raw: str) -> dict | None:
         try:
@@ -636,9 +696,25 @@ class BinanceFuturesBroker(BinanceAccountReader):
             total += cost * px
         return total
 
+    async def _settle(self, symbol: str, usym: str, oid: str, order: dict) -> dict:
+        """Cancel the unfilled rest of a market order that is still working and re-read it, so its
+        filled quantity is final (a partial fill must not be reported while more can still fill)."""
+        try:
+            await self._read(self.ex.cancel_order, oid, usym)
+        except ccxt.BaseError as e:
+            if not _nothing_to_cancel(e):  # "unknown order": it completed in the meantime
+                log.warning("%s: emir %s kalanı iptal edilemedi: %s", fmt.pair(symbol), oid,
+                            _scrub(str(e), self._secrets()))
+        try:
+            return await self._read(self.ex.fetch_order, oid, usym) or order
+        except ccxt.BaseError as e:
+            log.warning("%s: emir %s sorgulanamadı: %s", fmt.pair(symbol), oid, _scrub(str(e), self._secrets()))
+            return order
+
     async def _fill(self, symbol: str, usym: str, side: int, order: dict, ref_price: float,
                     latency_ms: float, cid: str) -> Fill | None:
-        """Actual fill of an accepted market order. Never raises once the order is known to have executed."""
+        """Final fill of an accepted market order (None if nothing filled). Raises OrderStateUnknown
+        when the filled quantity cannot be established."""
         oid = order.get("id")
         for i in range(_FILL_POLLS):
             status = order.get("status")
@@ -652,6 +728,8 @@ class BinanceFuturesBroker(BinanceAccountReader):
             except ccxt.BaseError as e:
                 log.warning("%s: emir %s sorgulanamadı: %s", fmt.pair(symbol), oid, _scrub(str(e), self._secrets()))
                 break
+        if order.get("status") not in _TERMINAL and oid:
+            order = await self._settle(symbol, usym, oid, order)
         status = order.get("status")
         filled, avg = _f(order.get("filled")), _f(order.get("average"))
         ts = order.get("lastTradeTimestamp") or order.get("timestamp")
@@ -665,6 +743,11 @@ class BinanceFuturesBroker(BinanceAccountReader):
             if status in _TERMINAL:
                 return None
             raise OrderStateUnknown(f"{fmt.pair(symbol)}: emir {cid} kabul edildi ama dolum bilgisi alınamadı "
+                                    f"(durum: {status}); pozisyonu Binance'te kontrol edin", cid)
+        amount = _f(order.get("amount"))
+        if status not in _TERMINAL and not (amount > 0 and filled >= amount * (1 - 1e-9)):
+            raise OrderStateUnknown(f"{fmt.pair(symbol)}: emir {cid} kısmen doldu ({fmt.qty(filled)}"
+                                    f"{f' / {fmt.qty(amount)}' if amount > 0 else ''}) ve kesinleşmedi "
                                     f"(durum: {status}); pozisyonu Binance'te kontrol edin", cid)
         if avg <= 0:
             cost = _f(order.get("cost"))
@@ -685,11 +768,19 @@ class BinanceFuturesBroker(BinanceAccountReader):
                     slippage_bps=slippage, latency_ms=latency_ms, timestamp=_timestamp(ts))
 
     # -- account -----------------------------------------------------------------------
-    async def positions(self) -> dict[str, ExchangePosition]:
-        """Open positions (non-zero contracts) of the configured symbols, keyed by raw symbol."""
-        if not self.symbol_map:
+    async def positions(self, symbols: Iterable[str] | None = None) -> dict[str, ExchangePosition]:
+        """Open positions (non-zero contracts) keyed by raw symbol: the tradeable symbols plus `symbols`.
+
+        Pass the symbols of every locally held position: one on a symbol removed from the config or left
+        unavailable at connect is otherwise invisible here (and would look closed). Passed symbols become
+        manageable (close_position, place/cancel_protection, last_close_fill), never tradeable.
+        """
+        for raw in symbols or ():
+            self._track(raw)
+        known = {**self.tracked, **self.symbol_map}
+        if not known:
             return {}
-        rows = await self._call(self._client().fetch_positions, list(self.symbol_map.values()))
+        rows = await self._call(self._client().fetch_positions, list(known.values()))
         out: dict[str, ExchangePosition] = {}
         for p in rows or []:
             raw = self._raw(p.get("symbol"))
@@ -697,8 +788,9 @@ class BinanceFuturesBroker(BinanceAccountReader):
             if raw is None or amount == 0:
                 continue
             leverage = _f(p.get("leverage"))
-            if leverage <= 0:
-                margin, notional = _f(p.get("initialMargin")), abs(_f(p.get("notional")))
+            if leverage <= 0:  # positionRisk v3 has no leverage; its initialMargin also counts open orders
+                margin = _f((p.get("info") or {}).get("positionInitialMargin")) or _f(p.get("initialMargin"))
+                notional = abs(_f(p.get("notional")))
                 leverage = (float(round(notional / margin)) if margin > 0 and notional > 0
                             else self.leverage.get(raw, float(self.cfg.live.leverage)))
             out[raw] = ExchangePosition(symbol=raw, side=LONG if amount > 0 else SHORT, qty=abs(amount),
@@ -713,7 +805,7 @@ class BinanceFuturesBroker(BinanceAccountReader):
 
         The filled qty can be smaller than requested (step rounding, partial fill): always use fill.qty.
         """
-        usym = self._unified(symbol)
+        usym = self._unified(symbol, opening=not reduce_only)
         oside = _order_side(side)
         amount = self._amount(symbol, usym, qty)
         if not reduce_only:  # Binance exempts reduce-only orders from the min notional filter
@@ -734,10 +826,14 @@ class BinanceFuturesBroker(BinanceAccountReader):
         return fill
 
     async def close_position(self, symbol: str, position_side: int, qty: float, ref_price: float) -> Fill | None:
-        """Reduce-only market order against the position; None when the exchange has nothing to reduce."""
+        """Reduce-only market order against the position; None when the exchange has nothing to reduce.
+
+        A partially filled close (e.g. the market order expired by price protection) is completed with a
+        second reduce-only order; the returned fill covers both.
+        """
         fill, rejected = await self._try_close(symbol, position_side, qty, ref_price)
         if rejected is None:
-            return fill
+            return await self._close_rest(symbol, position_side, qty, ref_price, fill)
         try:
             current = await self._signed_amount(self._unified(symbol))
         except ccxt.BaseError as e:
@@ -748,9 +844,31 @@ class BinanceFuturesBroker(BinanceAccountReader):
         if abs(current) < qty:
             fill, again = await self._try_close(symbol, position_side, abs(current), ref_price)
             if again is None:
-                return fill
+                return await self._close_rest(symbol, position_side, abs(current), ref_price, fill)
             raise again
         raise rejected
+
+    async def _close_rest(self, symbol: str, position_side: int, qty: float, ref_price: float,
+                          fill: Fill | None) -> Fill | None:
+        if fill is None or fill.qty >= qty * (1 - 1e-9):
+            return fill
+        try:
+            current = await self._signed_amount(self._unified(symbol))
+        except ccxt.BaseError as e:
+            log.warning("%s: kapanış sonrası pozisyon okunamadı: %s", fmt.pair(symbol), _scrub(str(e), self._secrets()))
+            return fill
+        same_side = current != 0 and (current > 0) == (position_side == LONG)
+        left = min(qty - fill.qty, abs(current)) if same_side else 0.0
+        if left <= 0:
+            return fill
+        log.warning("%s: kapanış emri kısmen doldu (%s / %s), kalan %s kapatılıyor", fmt.pair(symbol),
+                    fmt.qty(fill.qty), fmt.qty(qty), fmt.qty(left))
+        try:
+            more, _ = await self._try_close(symbol, position_side, left, ref_price)
+        except OrderRejected as e:  # e.g. the rest is below the minimum order size: not executed
+            self._warn(f"{fmt.pair(symbol)}: pozisyonun kalanı ({fmt.qty(left)}) kapatılamadı: {e}")
+            return fill
+        return _merge_fills(fill, more) if more is not None else fill
 
     async def _try_close(self, symbol: str, position_side: int, qty: float,
                          ref_price: float) -> tuple[Fill | None, OrderRejected | None]:
