@@ -41,7 +41,8 @@ Pine Script'teki momentum: `val = linreg(close − ort(ort(en yüksek, en düş�
 - **SHORT:** kapanış **VWAP altında** ve momentum **alıcıdan satıcıya döndü**.
 - **Stop:** giriş anındaki ATR'ye göre (varsayılan 1.5×ATR). **Hedef:** riskin **1.1 katı** (1.1R).
 - **Erken çıkış:** hedefe varmadan LONG'da satıcı baskısı, SHORT'ta alıcı baskısı gelirse pozisyon mum
-  kapanışında piyasa emriyle kapanır.
+  kapanışında piyasa emriyle kapanır. O mumda ters yönün giriş kuralı da sağlanıyorsa pozisyon hemen ters çevrilir.
+  Örneğin LONG kapanırken fiyat VWAP'ın altındaysa SHORT açılır.
 - **Filtre:** HMM rejimi `TREND_UP`, `TREND_DOWN` veya `RANGE` olmalı (yüksek volatilite durumunda işlem yok) ve
   GARCH volatilitesi aşırı olmamalı.
 - VWAP her gün 00:00 UTC'de sıfırlanır (TradingView'ın kripto varsayılanı; `vwap_anchor` ile değişir).
@@ -87,8 +88,9 @@ python -m cappatrader resume                # kill-switch sonrası manuel devam 
 python -m cappatrader reset --yes           # hesap kaydını sıfırla (bot durdurulmuşken)
 ```
 
-Araştırma komutları HMM ve GARCH'ı her sembol için bir kez walk-forward eğitir; 2 yıllık 1h veride sembol başına
-yaklaşık 15-20 saniye sürer. Raporlar `reports/<tür>_<zaman>/` altına yazılır. Kağıt hesap `state/cappatrader.sqlite`,
+Araştırma komutları HMM ve GARCH'ı her sembol için bir kez walk-forward eğitir. 2 yıllık 1h veride bu, sembol başına
+yaklaşık 3-4 saniye sürer. `mode: live` iken araştırma verisi de USD-M futures mumlarından indirilir; botun işlem
+yaptığı piyasa budur. Raporlar `reports/<tür>_<zaman>/` altına yazılır. Kağıt hesap `state/cappatrader.sqlite`,
 canlı hesap `state/cappatrader_live_demo.sqlite` / `_live_mainnet.sqlite` içinde ayrı tutulur.
 
 ## Canlı işlem (Binance USD-M futures)
@@ -124,48 +126,57 @@ Canlı moddaki korumalar:
 
 ## Telegram mesajı örneği
 
-Kodun ürettiği gerçek çıktı (fiyatlar sentetik veriden geldiği için gerçekçi değil):
+Kodun ürettiği gerçek çıktı. Varsayılan Squeeze/VWAP stratejisi ve kağıt hesap kullanıldı; fiyatlar sentetik
+veriden geldiği için gerçekçi değil:
 
 ```
 🟢 ALIŞ (LONG) — ETH/USDT · KAĞIT HESAP
-Fiyat: 49,672.27 (sinyal 49,667.30 · slippage 1.0 bps · gecikme 0 ms)
-Miktar: 0.00604 ETH ≈ 300.02 USDT · komisyon 0.30 USDT
-Stop: 48,405.05 (-2.55%) · risk 7.65 USDT (%0.77 kasa)
-Rejim: Trend ↑ (yükseliş) · güven %89 · strateji: Trend takibi / momentum
+Fiyat: 52,528.22 (sinyal 52,494.72 · slippage 6.4 bps · gecikme 0 ms)
+Miktar: 0.00571 ETH ≈ 299.94 USDT · komisyon 0.30 USDT
+Stop: 51,841.99 (-1.31%) · risk 3.92 USDT (%0.39 kasa) · hedef 53,283.07
+Rejim: Yatay bant (ortalamaya dönüş) · güven %100 · strateji: Squeeze momentum + VWAP
 
 Neden alındı?
-• Rejim: Trend ↑ (yükseliş) · ADX 49.7 · volatilite normal (ATR 1.28%, 51. persentil)
-• Ensemble skoru +0.78 → güven %89 (eşik %65)
-• ▲ EMA20 > EMA50 (+2.53 ATR)
-• ▲ MACD sıfır çizgisinin üstünde (+663.7, histogram -91.54)
-• ▲ Fiyat 55 barlık kanalın %82 seviyesinde
+• Rejim: Yatay bant (ortalamaya dönüş) · HMM olasılığı %100 · volatilite normal · GARCH sonraki bar σ 0.77% (uzun dönem 2.26%, 0.34×) → boyut çarpanı ×1.00
+• ▲ Fiyat günlük VWAP'ın üstünde: kapanış 52,494.72 · VWAP 51,844.06 (+1.26%)
+• ▲ Squeeze momentum -173.5 (sıfırın altında), 1 bardır yükseliyor — alıcı baskısı
+• Squeeze yok: Bollinger bantları Keltner kanalının dışında
+• ▲ Boğa pivotu: momentum alt eşiğin (0) altında yukarı döndü
+• Stop 1.5×ATR, hedef 1.1R (sinyal kapanışına göre ≈ stop 51,808.49, hedef 53,249.57) · hedeften önce momentum satıcıya dönerse erken çıkış
 
 Pozisyon boyutu
 • Kelly için yetersiz geçmiş (0/30 işlem) → sabit %1.00 risk
-• Stop mesafesi 2×ATR = 2.55% (ATR yüksekse pozisyon otomatik küçülür)
-• Pozisyon tavanı (%30 kasa / kullanılabilir nakit) → gerçek risk 7.65 USDT
+• Stop mesafesi 1.5×ATR = 1.31% (ATR yüksekse pozisyon otomatik küçülür)
+• Pozisyon tavanı (%30 kasa / kullanılabilir nakit) → gerçek risk 3.92 USDT
 
-💼 Güncel bakiye: 999.67 USDT (-0.03% başlangıç 1,000.00 USDT)
-Nakit 699.68 USDT · açık pozisyon 1
+💼 Güncel bakiye: 999.51 USDT (-0.05% başlangıç 1,000.00 USDT)
+Nakit 699.76 USDT · açık pozisyon 1
 ```
 
 ```
 🔴 SATIŞ — pozisyon kapandı — ETH/USDT · KAĞIT HESAP
-Giriş 49,672.27 → Çıkış 50,705.24 (slippage 2.0 bps) · süre 0 sa 0 dk
-✅ P&L: +5.63 USDT (+1.88% · +0.74R) · komisyon 0.61 USDT dahil
+Giriş 52,528.22 → Çıkış 53,277.74 (slippage 1.0 bps)
+Miktar: 0.00571 ETH ≈ 304.22 USDT
+✅ P&L: +3.68 USDT (+1.23% · +0.94R) · komisyon 0.60 USDT dahil
 
 Neden satıldı?
-• İzleyen stop (trailing) tetiklendi — stop 50,715.39, kilitlenen hareket +2.10%
+• Hedef kâr (take-profit) seviyesine ulaşıldı
 
 Giriş gerekçesi (özet)
-• Rejim: Trend ↑ (yükseliş) · ADX 49.7 · volatilite normal (ATR 1.28%, 51. persentil)
-• Ensemble skoru +0.78 → güven %89 (eşik %65)
-• ▲ EMA20 > EMA50 (+2.53 ATR)
+• Rejim: Yatay bant (ortalamaya dönüş) · HMM olasılığı %100 · volatilite normal · GARCH sonraki bar σ 0.77% (uzun dönem 2.26%, 0.34×) → boyut çarpanı ×1.00
+• ▲ Fiyat günlük VWAP'ın üstünde: kapanış 52,494.72 · VWAP 51,844.06 (+1.26%)
+• ▲ Squeeze momentum -173.5 (sıfırın altında), 1 bardır yükseliyor — alıcı baskısı
 
-💼 Güncel bakiye: 1,005.63 USDT (+0.56% başlangıç 1,000.00 USDT)
-Nakit 1,005.63 USDT · açık pozisyon 0
-Realize P&L toplam +5.63 USDT · 1 işlem · kazanma %100
+💼 Güncel bakiye: 1,003.68 USDT (+0.37% başlangıç 1,000.00 USDT)
+Nakit 1,003.68 USDT · açık pozisyon 0
+Realize P&L toplam +3.68 USDT · 1 işlem · kazanma %100
 ```
+
+Hedefe varmadan momentum dönerse çıkış gerekçesi şöyle görünür:
+`• Momentum satıcıya döndü — hedefe ulaşmadan erken çıkış (momentum -29.06 < önceki -14.7)`.
+Fiyat VWAP'ın altındaysa aynı dönüş SHORT kuralını da sağlar. Bu durumda pozisyon kapatılır ve hemen SHORT açılır
+(stop-and-reverse); backtest de aynı şekilde çalışır. Canlı modda başlıkta `CANLI · DEMO (sanal para)` veya
+`CANLI · GERÇEK PARA` yazar ve bakiye Binance'ten okunur.
 
 Ayrıca: başlangıç mesajı (API anahtarı uyarılarıyla), günlük özet (20:00 UTC), kill-switch, günlük zarar limiti,
 flash hareket ve veri kesintisi (koruma modu) uyarıları.

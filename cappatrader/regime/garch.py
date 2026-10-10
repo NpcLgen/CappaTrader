@@ -19,7 +19,7 @@ import pandas as pd
 from arch import arch_model
 
 from cappatrader.config import GARCHConfig
-from cappatrader.regime.hmm import refit_buckets, refit_schedule, starts_chunk
+from cappatrader.regime.hmm import chunk_start, refit_buckets, refit_schedule
 
 log = logging.getLogger(__name__)
 
@@ -161,10 +161,9 @@ def walk_forward_garch(df: pd.DataFrame, cfg: GARCHConfig) -> pd.DataFrame:
 class OnlineGARCH:
     """Live counterpart of walk_forward_garch.
 
-    To reproduce the backtest exactly: before scoring a new closed bar, refit when
-    `due(bars)` (first bar of an epoch-anchored chunk) with `fit(bars.iloc[:-1])`, i.e. on
-    the bars before the one being scored; at start-up fit on the bars before
-    `chunk_start(bars.index, retrain_every)`.
+    To reproduce the backtest exactly: before scoring each new closed bar, call
+    `fit_chunk(bars)` when `due(bars)`; it fits on the bars before the epoch-anchored chunk of
+    the last bar, exactly the walk-forward training window (start-up and data outages included).
     """
 
     def __init__(self, cfg: GARCHConfig):
@@ -172,17 +171,31 @@ class OnlineGARCH:
         self.params: GARCHParams | None = None
         self.train_start: Any = None  # index label of the first training bar
         self.bars_since_fit = 0
+        self.chunk: int | None = None  # anchored refit chunk the current fit was made for
 
     def needs_fit(self) -> bool:
         return self.params is None or self.bars_since_fit >= self.cfg.retrain_every
 
     def due(self, df: pd.DataFrame) -> bool:
-        """Refit before forecasting from the last bar of df? Same epoch-anchored bars as walk_forward_garch."""
+        """Refit before forecasting from the last bar of df? Whenever that bar lies in an anchored chunk
+        the model was not fitted for (same bars as walk_forward_garch, outages included)."""
         if self.params is None:
             return True
-        if refit_buckets(df.index, self.cfg.retrain_every) is None:
+        b = refit_buckets(df.index, self.cfg.retrain_every)
+        if b is None:
             return self.needs_fit()
-        return starts_chunk(df.index, self.cfg.retrain_every)
+        return self.chunk != int(b[-1])
+
+    def fit_chunk(self, df: pd.DataFrame) -> bool:
+        """Fit for the chunk of df's last bar on the bars before that chunk starts (see OnlineHMM.fit_chunk)."""
+        b = refit_buckets(df.index, self.cfg.retrain_every)
+        if b is None:
+            return self.fit(df.iloc[:-1])
+        ok = self.fit(df.iloc[:chunk_start(df.index, self.cfg.retrain_every)])
+        if not ok and self.params is None:
+            ok = self.fit(df)
+        self.chunk = int(b[-1])
+        return ok
 
     def fit(self, df: pd.DataFrame) -> bool:
         r = pct_log_returns(df["close"])

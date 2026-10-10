@@ -15,7 +15,7 @@ def test_klines_to_frame():
     assert df["close"].iloc[0] == 1.5 and df["quote_volume"].iloc[0] == 15.0
 
 
-def test_clean_fills_gaps_fixes_ohlc_and_spikes(btc):
+def test_clean_fills_gaps_fixes_ohlc_and_reports_spikes(btc):
     df = btc.iloc[:300].copy()
     df = df.drop(df.index[[50, 51]])
     i = df.index[100]
@@ -26,8 +26,20 @@ def test_clean_fills_gaps_fixes_ohlc_and_spikes(btc):
     out, rep = clean_klines(df, "1h")
     assert rep.gaps_filled == 2 and len(out) == 300
     assert rep.ohlc_fixed >= 1 and (out["high"] >= out["low"]).all()
-    assert rep.spikes_fixed == 1
-    assert abs(out.loc[j, "close"] / btc.loc[j, "close"] - 1) < 0.05
+    assert rep.spikes_detected == 1
+    assert out.loc[j, "close"] == df.loc[j, "close"]  # reported, not rewritten: a repair would need bar t+1
+
+
+def test_clean_klines_is_prefix_causal(btc):
+    df = btc.iloc[:400].copy()
+    df = df.drop(df.index[[50, 51]])
+    j = df.index[200]
+    df.loc[j, "close"] = df.loc[j, "close"] * 1.4
+    df.loc[j, "high"] = df.loc[j, "close"]
+    full, _ = clean_klines(df, "1h")
+    for cut in (150, 201, 202, 300):
+        part, _ = clean_klines(df.iloc[:cut], "1h")
+        pd.testing.assert_frame_equal(part, full.loc[: part.index[-1]], check_freq=False)
 
 
 def test_tick_filter_rejects_spike_but_follows_real_move():

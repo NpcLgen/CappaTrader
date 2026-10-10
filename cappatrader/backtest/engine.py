@@ -39,6 +39,7 @@ class BacktestResult:
     metrics: dict
     events: list[tuple] = field(default_factory=list)
     account: Account | None = None
+    pending: dict = field(default_factory=dict)  # orders decided on the last close (liquidate=False only)
 
     def summary(self, title: str = "Backtest") -> str:
         return format_metrics(self.metrics, title)
@@ -99,9 +100,11 @@ class Backtester:
 
     # -- main loop -----------------------------------------------------------
     def run(self, frames: dict[str, pd.DataFrame], start=None, end=None, collect_reasons: bool = True,
-            account: Account | None = None) -> BacktestResult:
+            account: Account | None = None, liquidate: bool = True, pending: dict | None = None) -> BacktestResult:
         """account: continue an existing account (walk-forward chains its OOS windows this way, so
-        balance, kill-switch state and Kelly history carry over exactly as in one live account)."""
+        balance, kill-switch state and Kelly history carry over exactly as in one live account).
+        liquidate=False keeps the open positions at the end and returns the orders decided on the
+        last close in result.pending; pass them as `pending` to the next run to continue seamlessly."""
         cfg = self.cfg
         symbols = list(frames)
         views = {s: FrameView(f) for s, f in frames.items()}
@@ -117,7 +120,8 @@ class Backtester:
         acct = account if account is not None else Account(cfg.account.starting_balance)
         start_balance = acct.equity({})
         first_trade = len(acct.trades)
-        pending: dict[str, dict] = {}
+        # carried orders: exec_k is relative to the first bar of this run
+        pending: dict[str, dict] = {s: dict(p) for s, p in (pending or {}).items()}
         last: dict[str, float] = {}
         last_exit_k: dict[str, int] = {}
         events: list[tuple] = []
@@ -139,6 +143,10 @@ class Backtester:
                     if p["kind"] == "exit" and s in acct.positions:
                         self._close(acct, s, o, v, i, ts, p["reason"])
                         last_exit_k[s] = k
+                        rev = p.get("reverse")
+                        others = sum(1 for q in pending.values() if q["kind"] == "enter")
+                        if rev is not None and self.risk.entry_allowed(acct, s, ts, others)[0]:
+                            self._open(acct, s, o, v, i, ts, rev["decision"], rev["reasons"], last)
                     elif p["kind"] == "enter" and s not in acct.positions and not acct.halted:
                         self._open(acct, s, o, v, i, ts, p["decision"], p["reasons"], last)
                 pos = acct.positions.get(s)
@@ -177,6 +185,9 @@ class Backtester:
                 d = decide(self.decider, cfg, s, views[s], i, pos, bse)
                 if d.action == "EXIT":
                     pending[s] = {"kind": "exit", "exec_k": k + 1 + delay, "reason": d.exit_reason}
+                    if d.reverse is not None:  # stop-and-reverse: the opposite entry follows the close fill
+                        reasons = explain_decision(cfg, views[s].row(i), d.reverse.side) if collect_reasons else []
+                        pending[s]["reverse"] = {"decision": d.reverse, "reasons": reasons}
                 elif d.action in ("ENTER_LONG", "ENTER_SHORT"):
                     ok, _ = self.risk.entry_allowed(acct, s, ts, n_pending_entries)
                     if ok:
@@ -186,8 +197,10 @@ class Backtester:
             eq_vals[k] = eq
             exposed[k] = bool(acct.positions)
 
-        # close whatever is still open at the final close
-        if len(master):
+        carry: dict[str, dict] = {}
+        if not liquidate:
+            carry = {s: {**p, "exec_k": max(p["exec_k"] - len(master), 0)} for s, p in pending.items()}
+        elif len(master):  # close whatever is still open at the final close
             ts = master[-1]
             for s in list(acct.positions):
                 i = lookup[s].get(ts, len(views[s]) - 1)
@@ -199,7 +212,7 @@ class Backtester:
         trades = acct.trades[first_trade:]
         metrics = compute_metrics(equity, trades, cfg.bars_per_year, bench,
                                   exposure=float(exposed.mean()) if len(exposed) else 0.0)
-        return BacktestResult(equity, bench, trades, metrics, events, acct)
+        return BacktestResult(equity, bench, trades, metrics, events, acct, carry)
 
 
 def run_backtest(cfg: Config, data: dict[str, pd.DataFrame], ml_probas: dict[str, pd.Series] | None = None,

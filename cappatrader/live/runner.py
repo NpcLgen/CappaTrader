@@ -216,18 +216,17 @@ class LiveEngine:
             if self.use_ml:
                 ok = await asyncio.to_thread(self.ml[s].fit, self.bars[s])
                 log.info("%s ML modeli %s", s, "eğitildi" if ok else "eğitilemedi (yetersiz veri)")
-            for kind, models, rcfg in (("HMM rejim", self.hmm, cfg.regime.hmm), ("GARCH", self.garch, cfg.regime.garch)):
-                if s not in models:
-                    continue
-                from cappatrader.regime.hmm import chunk_start
-
-                # the backtest scores the current chunk with a fit on the bars before the chunk start
-                cut = chunk_start(self.bars[s].index, rcfg.retrain_every)
-                ok = await asyncio.to_thread(models[s].fit, self.bars[s].iloc[:cut])
-                if not ok:
-                    ok = await asyncio.to_thread(models[s].fit, self.bars[s])
-                log.info("%s %s modeli %s", s, kind, "eğitildi" if ok else "eğitilemedi (yetersiz veri)")
+            for kind, models in (("HMM rejim", self.hmm), ("GARCH", self.garch)):
+                if s in models:  # the backtest scores the current chunk with a fit on the bars before it
+                    ok = await asyncio.to_thread(models[s].fit_chunk, self.bars[s])
+                    log.info("%s %s modeli %s", s, kind, "eğitildi" if ok else "eğitilemedi (yetersiz veri)")
         if self.live:
+            if cfg.live.env == "mainnet":  # demo.binance.com keys have no /sapi endpoint
+                restrictions = await self._check_api_key()
+                if restrictions.get("enableWithdrawals"):
+                    raise RuntimeError("API anahtarında PARA ÇEKME yetkisi açık: gerçek parayla işlem bu anahtarla "
+                                       "başlatılmaz. Binance > API Yönetimi'nden para çekmeyi kapatın ve IP kısıtlaması "
+                                       "ekleyin (PRD §6).")
             await self._connect_futures()
         else:
             await self._check_api_key()
@@ -236,21 +235,23 @@ class LiveEngine:
             await self.alt.refresh(await self.http())
             self._last_alt = time.time()
 
-    async def _check_api_key(self) -> None:
+    async def _check_api_key(self) -> dict:
+        """Warn about risky API-key permissions (PRD §6); returns Binance's apiRestrictions ({} if unknown)."""
         if not self.cfg.secrets.has_binance:
             log.info("Binance API anahtarı yok: paper modda gerekli değil")
-            return
+            return {}
         try:
             r = await self.rest.api_restrictions()
         except Exception as exc:
             self.warnings.append(f"API anahtarı yetki kontrolü yapılamadı: {exc}")
-            return
+            return {}
         if r.get("enableWithdrawals"):
             self.warnings.append("API anahtarında PARA ÇEKME yetkisi AÇIK — Binance'te hemen kapatın (PRD güvenlik)")
         if not r.get("ipRestrict"):
             self.warnings.append("API anahtarında IP kısıtlaması yok — sunucu IP'sine kısıtlamanız önerilir")
         if not self.live and (r.get("enableSpotAndMarginTrading") or r.get("enableFutures")):
             self.warnings.append("API anahtarında işlem yetkisi açık; paper mod için yalnızca okuma yetkisi yeterli")
+        return r
 
     async def _seed_paper_balance(self) -> None:
         """balance_source "binance": a brand-new paper account starts from the real Binance balance."""
@@ -290,11 +291,20 @@ class LiveEngine:
                 self.warnings.append(w)
         self._broker_warnings(drain_only=True)
         await self.refresh_balance()
-        if self._fresh_account and not self.account.positions:
+        if self._fresh_account or (not self.account.trades and not self.account.positions):
+            # a new (or reset, or never-traded) live ledger starts from the real futures equity
             self._reset_account_balance(self.equity())
         self.binance_balance_note = (f"Binance futures: cüzdan {fmt.usd(self.wallet or 0)}, "
                                      f"kullanılabilir {fmt.usd(self.available or 0)}")
         await self.reconcile_positions(startup=True)
+        if self.store.get_kv("reseed_peak"):
+            # `resume` cannot know the live equity offline: restart the drawdown / daily windows from Binance's
+            a, eq = self.account, self.equity()
+            a.peak_equity = a.day_start_equity = eq
+            a.day = _now().strftime("%Y-%m-%d")
+            self.store.set_kv("reseed_peak", "")
+            self.store.save_account(a)
+            log.info("Zirve ve gün başı bakiye Binance özsermayesinden yeniden başlatıldı: %.2f USDT", eq)
 
     async def refresh_balance(self) -> None:
         bal = await self.futures.balance()
@@ -545,15 +555,14 @@ class LiveEngine:
     async def _live_layers(self, sym: str, bars: pd.DataFrame) -> dict:
         """Single-bar HMM / GARCH layers from the online models (only the last row is filled).
 
-        A refit only sees the bars before the one being scored, like the walk-forward backtest."""
+        Refits happen on the walk-forward's anchored bars and only see the bars before the chunk."""
         layers: dict = {}
-        history = bars.iloc[:-1]
         if sym in self.hmm:
             m = self.hmm[sym]
             m.bars_since_fit += 1
             if m.due(bars):
                 async with self.fit_lock:
-                    await asyncio.to_thread(m.fit, history)
+                    await asyncio.to_thread(m.fit_chunk, bars)
             label, prob, state = m.infer_last(bars)
             h = pd.DataFrame({"hmm_state": np.nan, "hmm_label": "UNKNOWN", "hmm_prob": np.nan}, index=bars.index)
             h.iloc[-1] = [state, label, prob]
@@ -563,7 +572,7 @@ class LiveEngine:
             g.bars_since_fit += 1
             if g.due(bars):
                 async with self.fit_lock:
-                    await asyncio.to_thread(g.fit, history)
+                    await asyncio.to_thread(g.fit_chunk, bars)
             vals = g.forecast_last(bars)
             gdf = pd.DataFrame(np.nan, index=bars.index, columns=GARCH_COLS)
             gdf.iloc[-1] = [vals.get(c, np.nan) for c in GARCH_COLS]
@@ -625,28 +634,41 @@ class LiveEngine:
                if last_exit else None)
         d = decide(self.decider, cfg, sym, v, i, pos, bse)
         log.info("%s bar %s | rejim %s/%s | skor %+.2f | %s", sym, ts, d.regime, d.vol_state, d.composite, d.action)
+        notes = {"orderflow": of_note, "sentiment": sent_note}
         if d.action == "EXIT":
-            self._spawn(sym, self.close_position(sym, d.exit_reason))
+            if d.reverse is not None:  # stop-and-reverse, as in the backtest: open the opposite side after the close
+                self._spawn(sym, self._exit_then_enter(sym, d, f.iloc[i], notes))
+            else:
+                self._spawn(sym, self.close_position(sym, d.exit_reason))
         elif d.action in ("ENTER_LONG", "ENTER_SHORT"):
-            ok, why = self.risk.entry_allowed(self.account, sym, _now(), len(self.pending_entries - {sym}))
-            if self.protection:
-                ok, why = False, "Koruma modu (veri akışı sorunlu)"
-            if sym in self.manage_only:
-                ok, why = False, "parite ayarlarda yok (yalnızca açık pozisyon takibi)"
-            if ok:
-                notes = {"orderflow": of_note, "sentiment": sent_note}
+            if self._entry_ok(sym):
                 self.pending_entries.add(sym)
                 self._spawn(sym, self._entry_task(sym, d, f.iloc[i], notes))
-            else:
-                log.info("%s giriş sinyali reddedildi: %s", sym, why)
         await self.check_guards()
         self.store.save_account(self.account)
+
+    def _entry_ok(self, sym: str) -> bool:
+        ok, why = self.risk.entry_allowed(self.account, sym, _now(), len(self.pending_entries - {sym}))
+        if self.protection:
+            ok, why = False, "Koruma modu (veri akışı sorunlu)"
+        if sym in self.manage_only:
+            ok, why = False, "parite ayarlarda yok (yalnızca açık pozisyon takibi)"
+        if not ok:
+            log.info("%s giriş sinyali reddedildi: %s", sym, why)
+        return ok
 
     async def _entry_task(self, sym: str, d: Decision, row: pd.Series, notes: dict[str, str]) -> None:
         try:
             await self.open_position(sym, d, row, notes)
         finally:
             self.pending_entries.discard(sym)
+
+    async def _exit_then_enter(self, sym: str, d: Decision, row: pd.Series, notes: dict[str, str]) -> None:
+        await self.close_position(sym, d.exit_reason)
+        if sym in self.account.positions or not self._entry_ok(sym):  # the close failed or entries are blocked
+            return
+        self.pending_entries.add(sym)
+        await self._entry_task(sym, d.reverse, row, notes)
 
     async def open_position(self, sym: str, d: Decision, row: pd.Series, notes: dict[str, str]) -> None:
         cfg = self.cfg

@@ -61,6 +61,9 @@ def decide(decider, cfg: Config, symbol: str, v: FrameView, i: int, position: Po
            bars_since_exit: int | None) -> Decision:
     d = decider.evaluate(symbol, v, i, position, bars_since_exit)
     d.size_mult = size_mult_at(cfg, v, i)
+    rev = getattr(d, "reverse", None)
+    if rev is not None:
+        rev.size_mult = d.size_mult
     return d
 
 

@@ -264,8 +264,9 @@ async def _print_balances(cfg: Config) -> int:
                 print(f"  Spot USDT    : okunamadı ({exc})")
     finally:
         await reader.close()
-    src = cfg.account.binance_wallet
-    print(f"Kağıt hesap 'balance_source: binance' iken başlangıç bakiyesi olarak {src} cüzdanı kullanılır.")
+    if cfg.mode != "live":
+        print(f"Kağıt hesap 'balance_source: binance' iken başlangıç bakiyesi olarak {cfg.account.binance_wallet} "
+              "cüzdanı kullanılır.")
     return 1 if failed == (2 if reader.env == "mainnet" else 1) else 0
 
 
@@ -302,9 +303,23 @@ def cmd_status(args, cfg: Config) -> int:
             asyncio.run(fetch())
         except Exception as exc:
             print(f"(Güncel fiyat alınamadı: {exc}; giriş fiyatları kullanılıyor)")
-    eq = acct.equity(prices)
-    print(f"Kağıt hesap: başlangıç {fmt.usd(acct.starting_balance)} · bakiye {fmt.usd(eq)} "
-          f"({fmt.pct(eq / acct.starting_balance - 1, signed=True)}) · nakit {fmt.usd(acct.cash)}")
+    if cfg.mode == "live":
+        # the ledger's cash is Binance's free margin, not a balance: read the real equity instead
+        print(f"Canlı hesap (yerel defter): başlangıç özsermayesi {fmt.usd(acct.starting_balance)}")
+        if args.offline or not cfg.secrets.has_binance:
+            print("  Güncel bakiye için: python -m cappatrader balance")
+        else:
+            try:
+                rc = asyncio.run(_print_balances(cfg))
+            except Exception as exc:
+                rc = 1
+                print(f"  (Binance bakiyesi okunamadı: {exc})")
+            if rc:
+                print("  Güncel bakiye okunamadı; borsadaki değerler esastır.")
+    else:
+        eq = acct.equity(prices)
+        print(f"Kağıt hesap: başlangıç {fmt.usd(acct.starting_balance)} · bakiye {fmt.usd(eq)} "
+              f"({fmt.pct(eq / acct.starting_balance - 1, signed=True)}) · nakit {fmt.usd(acct.cash)}")
     print(f"Realize P&L {fmt.usd(acct.realized_pnl, signed=True)} · {len(acct.trades)} işlem · toplam komisyon "
           f"{acct.total_fees:.2f} USDT")
     if acct.halted:
@@ -340,11 +355,13 @@ def cmd_reset(args, cfg: Config) -> int:
     if args.balance is not None and not (args.balance > 0 and args.balance < float("inf")):
         print("✘ --balance pozitif bir sayı olmalı.")
         return 1
-    if cfg.mode == "live":
-        print("Not: canlı modda bakiye her zaman Binance'ten okunur; bu komut yalnızca yerel kaydı siler.")
     store = StateStore(cfg.state_db)
     acct = store.reset(args.balance or cfg.account.starting_balance)
-    print(f"Kağıt hesap sıfırlandı: {fmt.usd(acct.cash)}")
+    if cfg.mode == "live":
+        print("Canlı hesabın yerel defteri sıfırlandı (işlem geçmişi silindi). Borsadaki pozisyonlara dokunulmadı; "
+              "bakiye bot başlarken Binance'ten okunur, açık pozisyonlar devralınır.")
+    else:
+        print(f"Kağıt hesap sıfırlandı: {fmt.usd(acct.cash)}")
     store.close()
     return 0
 
@@ -357,6 +374,16 @@ def cmd_resume(args, cfg: Config) -> int:
     store = StateStore(cfg.state_db)
     acct = store.load_account(cfg.account.starting_balance)
     acct.halted, acct.halt_reason, acct.paused_until = False, "", None
+    if cfg.mode == "live":
+        # the live equity is wallet + unrealized P&L on Binance, unknown offline: the engine resets the
+        # peak and the daily window from it at the next start (the ledger's cash is only free margin)
+        store.set_kv("reseed_peak", "1")
+        acct.day = None
+        store.save_account(acct)
+        print("Kill-switch / günlük duraklatma kaldırıldı; zirve bakiye bot başlarken Binance özsermayesinden "
+              "yeniden başlatılacak.")
+        store.close()
+        return 0
     acct.peak_equity = acct.cash + sum(p.collateral for p in acct.positions.values())
     # restart the daily window too, otherwise today's loss re-triggers the pause immediately
     acct.day, acct.day_start_equity = None, acct.peak_equity

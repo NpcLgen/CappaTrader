@@ -99,16 +99,16 @@ def size_position(
         return res
     frac, kelly_note = risk_fraction(cfg, trades)
     res.notes.append(kelly_note)
-    mult = 1.0
+    mult, mult_note = 1.0, ""
     if size_mult is not None and math.isfinite(size_mult):
         mult = min(max(size_mult, 0.0), 1.0)
         if mult < 1.0:
-            res.notes.append(f"GARCH volatilite tahmini uzun dönem ortalamasının üstünde → boyut ×{mult:.2f}")
+            mult_note = f"GARCH volatilite tahmini uzun dönem ortalamasının üstünde → boyut ×{mult:.2f}"
     if vol_state == VOL_HIGH and cfg.high_vol_size_mult < mult:
         mult = cfg.high_vol_size_mult
-        res.notes.append(f"Yüksek volatilite rejimi → boyut ×{mult:g}")
+        mult_note = f"Yüksek volatilite rejimi → boyut ×{mult:g}"
     res.risk_fraction = frac * mult
-    res.risk_amount = equity * res.risk_fraction
+    res.risk_amount = equity * frac
     res.stop_distance = cfg.atr_stop_mult * atr
     res.notes.append(
         f"Stop mesafesi {cfg.atr_stop_mult:g}×ATR = {res.stop_distance / price * 100:.2f}% "
@@ -124,8 +124,15 @@ def size_position(
             )
     qty = res.risk_amount / res.stop_distance
     cap_notional = min(cfg.max_position_pct * equity, available_cash * 0.995)
-    if qty * price > cap_notional:
+    capped = qty * price > cap_notional
+    if capped:
         qty = max(cap_notional, 0.0) / price
+    # the volatility multiplier scales the final size (after the caps), so a high GARCH forecast or a
+    # HIGH volatility regime always shrinks the exposure, also when the position cap binds
+    qty *= mult
+    if mult_note:
+        res.notes.append(mult_note)
+    if capped:
         res.notes.append(
             f"Pozisyon tavanı (%{cfg.max_position_pct * 100:.0f} kasa / kullanılabilir nakit) → gerçek risk "
             f"{qty * res.stop_distance:.2f} USDT"

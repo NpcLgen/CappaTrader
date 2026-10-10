@@ -386,10 +386,9 @@ def walk_forward_hmm(df: pd.DataFrame, cfg: HMMConfig) -> pd.DataFrame:
 class OnlineHMM:
     """Live counterpart of walk_forward_hmm.
 
-    To reproduce the backtest exactly: before scoring a new closed bar, refit when
-    `due(bars)` (first bar of an epoch-anchored chunk) with `fit(bars.iloc[:-1])`, i.e. on
-    the bars before the one being scored; at start-up fit on the bars before
-    `chunk_start(bars.index, retrain_every)`.
+    To reproduce the backtest exactly: before scoring each new closed bar, call
+    `fit_chunk(bars)` when `due(bars)`; it fits on the bars before the epoch-anchored chunk of
+    the last bar, exactly the walk-forward training window (start-up and data outages included).
     """
 
     def __init__(self, cfg: HMMConfig):
@@ -397,18 +396,33 @@ class OnlineHMM:
         self.fitted: FittedHMM | None = None
         self.train_start: Any = None  # index label of the first training row
         self.bars_since_fit = 0
+        self.chunk: int | None = None  # anchored refit chunk the current fit was made for
 
     def needs_fit(self) -> bool:
         return self.fitted is None or self.bars_since_fit >= self.cfg.retrain_every
 
     def due(self, df: pd.DataFrame) -> bool:
-        """Refit before scoring the last bar of df? On the first bar of every epoch-anchored chunk,
-        exactly where walk_forward_hmm refits (falls back to needs_fit for a non-datetime index)."""
+        """Refit before scoring the last bar of df? Whenever that bar lies in an epoch-anchored chunk
+        the model was not fitted for, exactly where walk_forward_hmm refits, also when the chunk's
+        first bar was missed (data outage). Falls back to needs_fit for a non-datetime index."""
         if self.fitted is None:
             return True
-        if refit_buckets(df.index, self.cfg.retrain_every) is None:
+        b = refit_buckets(df.index, self.cfg.retrain_every)
+        if b is None:
             return self.needs_fit()
-        return starts_chunk(df.index, self.cfg.retrain_every)
+        return self.chunk != int(b[-1])
+
+    def fit_chunk(self, df: pd.DataFrame) -> bool:
+        """Fit for the chunk of df's last bar on the bars before that chunk starts (the walk-forward
+        training window), falling back to all of df when that leaves too little data."""
+        b = refit_buckets(df.index, self.cfg.retrain_every)
+        if b is None:
+            return self.fit(df.iloc[:-1])
+        ok = self.fit(df.iloc[:chunk_start(df.index, self.cfg.retrain_every)])
+        if not ok and self.fitted is None:
+            ok = self.fit(df)
+        self.chunk = int(b[-1])  # like the walk-forward, a failed refit keeps the old model for this chunk
+        return ok
 
     def fit(self, df: pd.DataFrame) -> bool:
         feats = hmm_features(df, self.cfg.feature_window)

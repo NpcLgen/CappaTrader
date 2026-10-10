@@ -9,6 +9,7 @@ momentum turns against the trade before the target is reached.
 
 from __future__ import annotations
 
+import copy
 import math
 import numbers
 
@@ -108,20 +109,36 @@ class SqueezeVwapEngine:
                 d.action = "EXIT"
                 d.exit_reason = (f"Momentum alıcıya döndü — hedefe ulaşmadan erken çıkış "
                                  f"(momentum {_num(val)} > önceki {_num(prev)})")
+            if d.action == "EXIT":
+                # the turn that closes the trade can be a valid opposite entry on the same bar
+                # (LONG closes on buyer->seller below VWAP = the SHORT rule): reverse after the close
+                entry = self._entry_action(v, i, d)
+                if entry is not None and (entry == "ENTER_SHORT") == (position.side == LONG):
+                    rev = copy.copy(d)
+                    rev.action, rev.exit_reason, rev.reverse = entry, "", None
+                    d.reverse = rev
             return d
 
+        entry = self._entry_action(v, i, d)
+        if entry is not None:
+            d.action = entry
+        return d
+
+    def _entry_action(self, v: FrameView, i: int, d: Decision) -> str | None:
+        """ENTER_LONG / ENTER_SHORT when bar i passes every entry gate, else None."""
+        close, atr, val = d.close, d.atr, _f(v["sqz_val"][i])
         if not (math.isfinite(close) and math.isfinite(atr) and atr > 0 and math.isfinite(val)):
-            return d
+            return None
         if d.regime == UNKNOWN or d.regime not in self.sq.tradeable_regimes or d.vol_state == VOL_EXTREME:
-            return d
+            return None
         vw = _f(v["vwap"][i])
         if not math.isfinite(vw):
-            return d
+            return None
         if close > vw and self.long_signal(v, i):
-            d.action = "ENTER_LONG"
-        elif self.cfg.account.allow_short and close < vw and self.short_signal(v, i):
-            d.action = "ENTER_SHORT"
-        return d
+            return "ENTER_LONG"
+        if self.cfg.account.allow_short and close < vw and self.short_signal(v, i):
+            return "ENTER_SHORT"
+        return None
 
 
 def _ok(x) -> bool:

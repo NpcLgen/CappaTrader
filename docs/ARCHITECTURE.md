@@ -11,7 +11,7 @@ hesap veya Binance USD-M futures'tur.
                              │ WS                                   Alternatif: Fear&Greed, RSS
  1. Veri Kaynağı   data/binance_ws.py  data/binance_rest.py  data/alt_data.py
                              │
- 2. Ön İşleme      data/cleaning.py      TickFilter (absürt print), clean_klines (eksik mum, iğne, OHLC)
+ 2. Ön İşleme      data/cleaning.py      TickFilter (absürt print), clean_klines (eksik mum, OHLC; iğne yalnızca raporlanır)
                    data/orderbook.py     OrderBook (imbalance, duvarlar, VWAP dolum), SpoofDetector, TradeFlow
                    features/indicators.py  EMA, RSI, MACD, ATR, ADX, Bollinger, Donchian (hepsi nedensel)
                              │  DF
@@ -36,7 +36,7 @@ hesap veya Binance USD-M futures'tur.
                    strategy/explain.py   Türkçe gerekçe satırları (Telegram + işlem kaydı)
                    strategy/factory.py   aktif stratejinin karar motoru, risk ayarı, açıklaması, GARCH çarpanı
                              │  SIG
- 5. Risk           risk/sizing.py        Kelly risk payı × GARCH çarpanı / (ATR stop) → miktar, tavanlar
+ 5. Risk           risk/sizing.py        Kelly risk payı / ATR stop → miktar → tavanlar → × GARCH / yüksek vol çarpanı
                    risk/stops.py         stop, izleyen stop, take-profit
                    risk/manager.py       kill-switch (%15 DD), günlük limit, max pozisyon, flash koruması
                              │  ORD

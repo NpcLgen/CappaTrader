@@ -33,19 +33,22 @@ class CleaningReport:
     duplicates: int = 0
     invalid_rows: int = 0
     ohlc_fixed: int = 0
-    spikes_fixed: int = 0
+    spikes_detected: int = 0
     gaps_filled: int = 0
 
     def __str__(self) -> str:
         return (f"tekrar {self.duplicates}, geçersiz {self.invalid_rows}, OHLC düzeltme {self.ohlc_fixed}, "
-                f"iğne düzeltme {self.spikes_fixed}, eksik mum doldurma {self.gaps_filled}")
+                f"olası iğne {self.spikes_detected} (değiştirilmedi), eksik mum doldurma {self.gaps_filled}")
 
 
 def clean_klines(df: pd.DataFrame, timeframe: str, mad_k: float = 8.0) -> tuple[pd.DataFrame, CleaningReport]:
-    """Offline cleaning for historical candles.
+    """Cleaning for historical and live candles; every repair is causal (prefix-stable).
 
-    A spike is a bar whose close jumps > mad_k robust deviations and immediately
-    reverts on the next bar; its close/wick are replaced by the neighbours' level.
+    Duplicates, non-positive / NaN prices and inconsistent OHLC are fixed row by row and
+    missing candles are forward-filled. A spike (a close that jumps > mad_k robust
+    deviations and reverts on the next bar) is only counted, never rewritten: telling it
+    apart from a real move needs bar t+1, so repairing it would let the backtest see the
+    future and skip stop-outs that live trading takes on the raw bar.
     """
     rep = CleaningReport()
     df = df.sort_index()
@@ -73,17 +76,7 @@ def clean_klines(df: pd.DataFrame, timeframe: str, mad_k: float = 8.0) -> tuple[
         spikes = (jump & revert).fillna(False).to_numpy()
         idx = np.where(spikes)[0]
         idx = idx[(idx > 0) & (idx < len(df) - 1)]
-        if len(idx):
-            close = df["close"].to_numpy().copy()
-            high = df["high"].to_numpy().copy()
-            low = df["low"].to_numpy().copy()
-            opn = df["open"].to_numpy()
-            for i in idx:
-                close[i] = 0.5 * (close[i - 1] + close[i + 1])
-                high[i] = max(opn[i], close[i], min(high[i], max(high[i - 1], high[i + 1])))
-                low[i] = min(opn[i], close[i], max(low[i], min(low[i - 1], low[i + 1])))
-            df["close"], df["high"], df["low"] = close, high, low
-            rep.spikes_fixed = len(idx)
+        rep.spikes_detected = len(idx)
 
     if len(df) > 1:
         full = pd.date_range(df.index[0], df.index[-1], freq=pd.Timedelta(milliseconds=TIMEFRAME_MS[timeframe]),

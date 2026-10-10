@@ -14,7 +14,7 @@ from cappatrader.risk.sizing import size_position
 from cappatrader.strategy.factory import explain_decision, make_decider, strategy_risk, uses_trailing
 from cappatrader.strategy.pipeline import prepare_universe, regime_layers
 from cappatrader.strategy.squeeze_decision import SqueezeVwapEngine
-from cappatrader.strategy.decision import DecisionEngine
+from cappatrader.strategy.decision import DecisionEngine, FrameView
 
 
 def test_default_strategy_is_squeeze_with_hmm_garch(cfg):
@@ -173,3 +173,54 @@ def test_explain_decision_dispatch(cfg, universe):
     assert lines[0].startswith("Rejim") and any("VWAP" in x for x in lines) and lines[-1] == "Emir defteri notu"
     ens = cfg.with_overrides({"strategy.name": "ensemble"})
     assert any("Ensemble skoru" in x for x in explain_decision(ens, row, LONG))
+
+
+def test_momentum_turn_reverses_long_into_short(cfg, universe):
+    # LONG closes when momentum turns to sellers; below VWAP that same turn is the SHORT rule, so the short
+    # is opened right after the close fill (stop-and-reverse) instead of being lost.
+    c = cfg.with_overrides({"account.allow_short": True, "risk.max_drawdown": 0.99, "risk.daily_loss_limit": 1.0,
+                            "risk.max_open_positions": 10})
+    frames = prepare_universe(universe, c)
+    r = Backtester(c).run(frames, collect_reasons=False)
+    eng = make_decider(c)
+    by_sym = {}
+    for t in r.trades:
+        by_sym.setdefault(t.symbol, []).append(t)
+    expected = reversed_ = 0
+    for s, trades in by_sym.items():
+        f = frames[s]
+        v = FrameView(f)
+        entries = {(t.entry_time, t.side) for t in trades}
+        for t in trades:
+            if t.side != LONG or not t.exit_reason.startswith("Momentum satıcıya"):
+                continue
+            i = f.index.get_loc(pd.Timestamp(t.exit_time)) - 1  # decision bar = bar before the exit fill
+            row = f.iloc[i]
+            gate = (row["regime"] in c.strategy.squeeze.tradeable_regimes and row["vol_state"] != "EXTREME"
+                    and row["close"] < row["vwap"] and eng.short_signal(v, i))
+            if gate:
+                expected += 1
+                reversed_ += (t.exit_time, SHORT) in entries
+    assert expected > 5 and reversed_ == expected
+
+
+def test_volatility_multiplier_shrinks_even_when_the_position_cap_binds():
+    cfg = RiskConfig(max_position_pct=0.30)
+    # 1% risk / 0.75% stop = 133% notional, far above the 30% cap
+    full = size_position(cfg, 1000, 1000, 100.0, 0.5, LONG, "NORMAL", [])
+    garch = size_position(cfg, 1000, 1000, 100.0, 0.5, LONG, "NORMAL", [], size_mult=0.6)
+    high = size_position(cfg, 1000, 1000, 100.0, 0.5, LONG, "HIGH", [])
+    assert full.qty * 100.0 == pytest.approx(300.0, rel=1e-6)
+    assert garch.qty == pytest.approx(full.qty * 0.6) and high.qty == pytest.approx(full.qty * cfg.high_vol_size_mult)
+    assert any("GARCH" in n for n in garch.notes) and garch.risk_amount == pytest.approx(garch.qty * garch.stop_distance)
+
+
+def test_walk_forward_keeps_positions_across_oos_windows(cfg, universe):
+    c = cfg.with_overrides({"account.allow_short": True})
+    c.walkforward.is_bars, c.walkforward.oos_bars = 1000, 500
+    c.walkforward.grid = {"strategy.squeeze.atr_stop_mult": [1.0, 2.0]}
+    res = walk_forward(c, universe, layers=regime_layers(universe, c))
+    forced = [t for t in res.oos_trades if t.exit_reason.startswith("Backtest sonu")]
+    last_oos_end = res.windows[-1].oos_end
+    assert all(pd.Timestamp(t.exit_time) >= pd.Timestamp(last_oos_end) - pd.Timedelta(hours=1) for t in forced)
+    assert len(forced) <= len(universe)

@@ -392,3 +392,125 @@ def test_broker_warnings_after_connect_reach_telegram(live_mode_cfg, universe):
 
     eng = asyncio.run(scenario())
     assert any("kâr al emri konamadı" in m for m in eng.notifier.messages) and not eng.futures.warnings
+
+
+def test_live_reverse_closes_then_opens_the_opposite_side(live_mode_cfg, universe):
+    import copy
+
+    fut = FakeFutures()
+
+    async def scenario():
+        eng = _engine(live_mode_cfg, universe, fut)
+        await eng.bootstrap()
+        sym = "BTCUSDT"
+        await _book(eng, sym, eng.last_price[sym])
+        d, row = _decision(eng, live_mode_cfg, sym)
+        await eng.open_position(sym, d, row, {})
+        exit_d = copy.copy(d)
+        exit_d.action, exit_d.exit_reason = "EXIT", "Momentum satıcıya döndü — hedefe ulaşmadan erken çıkış"
+        exit_d.reverse = copy.copy(d)
+        exit_d.reverse.action = "ENTER_SHORT"
+        fut.calls.clear()
+        await eng._exit_then_enter(sym, exit_d, row, {})
+        return eng
+
+    eng = asyncio.run(scenario())
+    kinds = [c[0] for c in fut.calls]
+    assert kinds.index("close") < kinds.index("market") < kinds.index("protect")
+    pos = eng.account.positions["BTCUSDT"]
+    assert pos.side == SHORT and pos.stop_price > pos.entry_price > pos.take_profit
+    assert len(eng.account.trades) == 1 and eng.account.trades[0].exit_reason.startswith("Momentum satıcıya")
+
+
+def test_live_ledger_reseeds_from_binance_after_reset_or_failed_start(live_mode_cfg, universe):
+    store = StateStore(":memory:")
+    store.reset(1000.0)  # e.g. `reset --yes`, or a first start that failed before connecting
+    fut = FakeFutures(wallet=400.0)
+
+    async def scenario():
+        eng = LiveEngine(live_mode_cfg, rest=FakeREST(universe), notifier=CaptureNotifier(), store=store, futures=fut)
+        await eng.bootstrap()
+        await eng.check_guards()
+        return eng
+
+    eng = asyncio.run(scenario())
+    a = eng.account
+    assert a.starting_balance == pytest.approx(400.0) and a.peak_equity == pytest.approx(400.0)
+    assert not a.halted
+
+
+def test_live_resume_reseeds_peak_from_binance_equity(live_mode_cfg, universe, tmp_path, monkeypatch):
+    from cappatrader import cli
+
+    live_mode_cfg.runtime.state_db = str(tmp_path / "s.sqlite")
+    db = live_mode_cfg.state_db  # the live/demo database the CLI uses too
+    fut = FakeFutures(wallet=1000.0)
+
+    async def run_once():
+        eng = LiveEngine(live_mode_cfg, rest=FakeREST(universe), notifier=CaptureNotifier(), store=StateStore(db),
+                         futures=fut)
+        await eng.bootstrap()
+        await _book(eng, "BTCUSDT", eng.last_price["BTCUSDT"])
+        if "BTCUSDT" not in eng.account.positions:
+            d, row = _decision(eng, live_mode_cfg, "BTCUSDT")
+            await eng.open_position("BTCUSDT", d, row, {})
+        await eng.check_guards()
+        eng.store.save_account(eng.account)
+        return eng
+
+    first = asyncio.run(run_once())
+    first.account.halted, first.account.halt_reason = True, "test"
+    first.store.save_account(first.account)
+    first.store.close()
+    monkeypatch.setattr(cli, "_engine_running", lambda c: False)
+
+    class Args:
+        pass
+
+    assert cli.cmd_resume(Args(), live_mode_cfg) == 0
+    second = asyncio.run(run_once())
+    a = second.account
+    # the old code planted cash (free margin) + collateral as the peak and fired a spurious kill-switch
+    assert not a.halted and a.peak_equity == pytest.approx(second.equity(), rel=1e-9)
+    assert not second.store.get_kv("reseed_peak")
+
+
+def test_mainnet_refuses_a_key_with_withdrawals_enabled(live_mode_cfg, universe):
+    from cappatrader.config import MAINNET_CONFIRM_PHRASE
+
+    c = live_mode_cfg.with_overrides({"live.env": "mainnet", "live.mainnet_confirm": MAINNET_CONFIRM_PHRASE})
+    c.symbols, c.pairs, c.secrets = live_mode_cfg.symbols, live_mode_cfg.pairs, live_mode_cfg.secrets
+    fut = FakeFutures()
+
+    async def scenario(restrictions):
+        eng = LiveEngine(c, rest=FakeREST(universe, restrictions=restrictions), notifier=CaptureNotifier(),
+                         store=StateStore(":memory:"), futures=fut)
+        await eng.bootstrap()
+        return eng
+
+    with pytest.raises(RuntimeError, match="PARA ÇEKME"):
+        asyncio.run(scenario({"enableWithdrawals": True, "ipRestrict": True}))
+    assert ("connect",) not in fut.calls  # refused before touching the futures account
+    eng = asyncio.run(scenario({"enableWithdrawals": False, "ipRestrict": False}))
+    assert any("IP kısıtlaması yok" in w for w in eng.warnings)
+
+
+def test_research_downloads_the_traded_market(live_mode_cfg, monkeypatch, tmp_path):
+    import cappatrader.data.history as history
+
+    seen = []
+
+    class Rest:
+        def __init__(self, ex, secrets=None, session=None, market="spot"):
+            seen.append(market)
+
+        async def klines_range(self, *a, **k):
+            return pd.DataFrame()
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(history, "BinanceREST", Rest)
+    c = live_mode_cfg.with_overrides({"data.data_dir": str(tmp_path)})
+    asyncio.run(history._download(c, ["BTCUSDT"], 0, 1))
+    assert seen == ["futures"] and history._cache_path(c, "BTCUSDT").name == "BTCUSDT_1h_futures.csv"

@@ -227,12 +227,14 @@ def test_online_hmm_matches_walk_forward(df):
     start, stop = 564, 664  # an anchored chunk whose training window [164, 564) is fully valid
     online = OnlineHMM(cfg)
     assert online.due(df) and online.infer_last(df)[0] == UNKNOWN
-    assert online.fit(df.iloc[:start])
+    assert online.fit_chunk(df.iloc[: start + 1])  # fits on the bars before the chunk: rows [164, 564)
+    assert online.train_start == df.index[164]
     for t in (start, start + 37, stop - 1):
         label, prob, state = online.infer_last(df.iloc[: t + 1])
         assert label == wf["hmm_label"].iloc[t] and state == wf["hmm_state"].iloc[t]
         assert prob == pytest.approx(wf["hmm_prob"].iloc[t], abs=1e-10)
-    assert online.due(df.iloc[: start + 1]) and not online.due(df.iloc[: start + 2]) and online.due(df.iloc[: stop + 1])
+        assert not online.due(df.iloc[: t + 1])
+    assert online.due(df.iloc[: stop + 1])
 
 
 def test_refits_are_anchored_on_time_not_on_the_data_start(df):
@@ -253,19 +255,20 @@ def test_refits_are_anchored_on_time_not_on_the_data_start(df):
     assert refit_buckets(pd.RangeIndex(10), 5) is None
 
 
-def _live_replay(df: pd.DataFrame, model, t0: int, t1: int, max_bars: int, score) -> tuple[list, list[int]]:
+def _live_replay(df: pd.DataFrame, model, t0: int, t1: int, max_bars: int, score, skip=()) -> tuple[list, list[int]]:
     """Bar-by-bar loop of LiveEngine: start-up fit on the bars before the current anchored chunk, then
     for every closed bar refit when due on the bars before it, then score the buffer's last row."""
     out, refits = [], []
-    boot = df.iloc[max(0, t0 - max_bars): t0]
-    assert model.fit(boot.iloc[: chunk_start(boot.index, model.cfg.retrain_every)])
+    assert model.fit_chunk(df.iloc[max(0, t0 - max_bars): t0])
     for t in range(t0, t1):
+        if t in skip:
+            continue  # bars missed during an outage: the next bar is scored on the backfilled buffer
         bars = df.iloc[max(0, t + 1 - max_bars): t + 1]
         model.bars_since_fit += 1
         if model.due(bars):
-            assert model.fit(bars.iloc[:-1])
+            assert model.fit_chunk(bars)
             refits.append(t)
-        out.append(score(model, bars))
+        out.append((t, score(model, bars)))
     return out, refits
 
 
@@ -276,18 +279,19 @@ def test_live_loop_matches_walk_forward_on_every_bar(df):
     wf_h, wf_g = walk_forward_hmm(df, hcfg), walk_forward_garch(df, gcfg)
     max_bars = hcfg.train_bars + hcfg.feature_window + 100  # LiveEngine.max_bars lower bound
 
-    got, refits = _live_replay(df, OnlineHMM(hcfg), 611, 911, max_bars, lambda m, b: m.infer_last(b))
-    assert refits == [664, 764, 864]
-    for t, (label, prob, state) in zip(range(611, 911), got):
-        assert label == wf_h["hmm_label"].iloc[t] and state == wf_h["hmm_state"].iloc[t], t
-        assert prob == pytest.approx(wf_h["hmm_prob"].iloc[t], abs=1e-6), t
+    for skip, expect in (((), [664, 764, 864]), (range(760, 770), [664, 770, 864])):  # second run: outage
+        got, refits = _live_replay(df, OnlineHMM(hcfg), 611, 911, max_bars, lambda m, b: m.infer_last(b), skip)
+        assert refits == expect
+        for t, (label, prob, state) in got:
+            assert label == wf_h["hmm_label"].iloc[t] and state == wf_h["hmm_state"].iloc[t], t
+            assert prob == pytest.approx(wf_h["hmm_prob"].iloc[t], abs=1e-6), t
 
-    got, refits = _live_replay(df, OnlineGARCH(gcfg), 600, 900, gcfg.train_bars + 100,
-                               lambda m, b: m.forecast_last(b))
-    assert refits == [664, 764, 864]
-    for t, vals in zip(range(600, 900), got):
-        for col, value in vals.items():
-            assert value == pytest.approx(wf_g[col].iloc[t], rel=1e-10), (t, col)
+        got, refits = _live_replay(df, OnlineGARCH(gcfg), 600, 900, gcfg.train_bars + 100,
+                                   lambda m, b: m.forecast_last(b), skip)
+        assert refits == expect
+        for t, vals in got:
+            for col, value in vals.items():
+                assert value == pytest.approx(wf_g[col].iloc[t], rel=1e-10), (t, col)
 
 
 def test_min_train_above_train_bars_still_fits(df):
@@ -374,7 +378,7 @@ def test_online_garch_matches_walk_forward(df):
     start, stop = 564, 664  # anchored chunk; training returns are rows [164, 564)
     online = OnlineGARCH(cfg)
     assert online.due(df) and np.isnan(online.forecast_last(df)["garch_vol"])
-    assert online.fit(df.iloc[:start])
+    assert online.fit_chunk(df.iloc[: start + 1])
     # The forecast for bar `start` made at the end of the fit window is arch's one-step forecast.
     y = pct_log_returns(df["close"])[164:start]
     res = arch_model(y, mean="Constant", vol="GARCH", p=1, q=1, dist="normal", rescale=False).fit(
@@ -386,6 +390,12 @@ def test_online_garch_matches_walk_forward(df):
         for col, value in got.items():
             assert value == pytest.approx(wf[col].iloc[t], rel=1e-12), col
     assert online.due(df.iloc[: stop + 1]) and not online.due(df.iloc[: stop])
+    # an outage that swallowed the chunk's first bars still refits on the walk-forward window
+    late = OnlineGARCH(cfg)
+    late.fit_chunk(df.iloc[: start + 1])
+    assert late.due(df.iloc[: stop + 7]) and late.fit_chunk(df.iloc[: stop + 7])
+    got = late.forecast_last(df.iloc[: stop + 7])
+    assert got["garch_vol"] == pytest.approx(wf["garch_vol"].iloc[stop + 6], rel=1e-12)
 
 
 # -- hybrid classifier -------------------------------------------------------------

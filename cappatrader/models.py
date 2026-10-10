@@ -29,6 +29,8 @@ class Decision:
     exit_reason: str = ""
     style: str = "TREND"  # TREND (momentum), MR (mean reversion) or SQZ (squeeze-VWAP): drives the exit rule
     size_mult: float = float("nan")  # GARCH volatility-forecast size multiplier (NaN = not used)
+    # EXIT only: the opposite entry signalled on the same bar (stop-and-reverse), executed after the close fill
+    reverse: Decision | None = None
 
     @property
     def side(self) -> int:

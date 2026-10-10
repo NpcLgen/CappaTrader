@@ -17,7 +17,10 @@ log = logging.getLogger(__name__)
 
 
 def _cache_path(cfg: Config, symbol: str) -> Path:
-    return Path(cfg.data.data_dir) / f"{symbol}_{cfg.timeframe}.csv"
+    # research uses the market the bot trades: USD-M perpetual klines in live mode (prices, volume and
+    # therefore VWAP differ from spot), so the two never share a cache file
+    suffix = "_futures" if cfg.data_market == "futures" else ""
+    return Path(cfg.data.data_dir) / f"{symbol}_{cfg.timeframe}{suffix}.csv"
 
 
 def _read(path: Path) -> pd.DataFrame:
@@ -28,11 +31,12 @@ def _read(path: Path) -> pd.DataFrame:
 
 
 async def _download(cfg: Config, symbols: list[str], start_ms: int, end_ms: int) -> dict[str, pd.DataFrame]:
-    rest = BinanceREST(cfg.exchange, cfg.secrets)
+    rest = BinanceREST(cfg.exchange, cfg.secrets, market=cfg.data_market)
     try:
         out = {}
         for s in symbols:
-            log.info("%s indiriliyor (%s)...", s, cfg.timeframe)
+            market = "USD-M futures" if cfg.data_market == "futures" else "spot"
+            log.info("%s indiriliyor (%s, %s)...", s, cfg.timeframe, market)
             out[s] = await rest.klines_range(s, cfg.timeframe, start_ms, end_ms)
         return out
     finally:
