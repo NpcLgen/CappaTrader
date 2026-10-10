@@ -1,7 +1,10 @@
 numpy>=1.26
 pandas>=2.1
 scikit-learn>=1.4
-aiohttp>=3.10
+aiohttp>=3.11
 python-dotenv>=1.0
 PyYAML>=6.0
+hmmlearn>=0.3
+arch>=7.0
+ccxt>=4.5
 pytest>=8

@@ -17,6 +17,7 @@ TREND_UP = "TREND_UP"
 TREND_DOWN = "TREND_DOWN"
 RANGE = "RANGE"
 TRANSITION = "TRANSITION"
+HIGH_VOL = "HIGH_VOL"  # HMM state with clearly elevated volatility
 UNKNOWN = "UNKNOWN"
 
 VOL_NORMAL = "NORMAL"
@@ -28,6 +29,7 @@ REGIME_TR = {
     TREND_DOWN: "Trend ↓ (düşüş)",
     RANGE: "Yatay bant (ortalamaya dönüş)",
     TRANSITION: "Geçiş (zayıf trend)",
+    HIGH_VOL: "Yüksek volatilite (HMM)",
     UNKNOWN: "Belirsiz (yetersiz veri)",
 }
 
@@ -39,8 +41,10 @@ VOL_TR = {
 
 
 def regime_kind(regime: str) -> str:
-    """Collapse TREND_UP/TREND_DOWN to TREND for weight lookup."""
-    return "TREND" if regime in (TREND_UP, TREND_DOWN) else regime
+    """Collapse TREND_UP/TREND_DOWN to TREND and HIGH_VOL to TRANSITION for weight lookup."""
+    if regime in (TREND_UP, TREND_DOWN):
+        return "TREND"
+    return TRANSITION if regime == HIGH_VOL else regime
 
 
 def classify(frame: pd.DataFrame, cfg: RegimeConfig) -> pd.DataFrame:

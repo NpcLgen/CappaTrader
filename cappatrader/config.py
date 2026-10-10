@@ -71,10 +71,53 @@ class AccountConfig:
     quote_asset: str = "USDT"
     # Spot is long-only. True simulates a 1x perpetual account (shorts allowed).
     allow_short: bool = False
+    # "virtual": paper account starts from starting_balance.
+    # "binance": read the real USDT balance (read-only key) and seed a fresh paper account with it.
+    # In live mode the balance always comes from Binance.
+    balance_source: str = "virtual"
+    binance_wallet: str = "futures"  # futures (USD-M) | spot
+
+
+@dataclass
+class HMMConfig:
+    """Hidden Markov Model regime detection (replaces ADX when regime.method == "hmm")."""
+
+    n_states: int = 3
+    feature_window: int = 12
+    train_bars: int = 2000
+    retrain_every: int = 250
+    min_train: int = 500
+    n_iter: int = 100
+    covariance_type: str = "full"
+    # A state is a trend when |mean smoothed return| >= trend_threshold * its mean volatility.
+    trend_threshold: float = 0.15
+    # The highest-volatility state is HIGH_VOL when its volatility >= high_vol_ratio * the calmest state's.
+    high_vol_ratio: float = 1.6
+    random_state: int = 42
+
+
+@dataclass
+class GARCHConfig:
+    """GARCH(p, q) next-bar volatility forecast (replaces ATR percentile when regime.vol_method == "garch")."""
+
+    p: int = 1
+    q: int = 1
+    train_bars: int = 1500
+    retrain_every: int = 250
+    min_train: int = 500
+    # forecast / long-run volatility ratio thresholds
+    high_ratio: float = 1.5
+    extreme_ratio: float = 2.5
+    # position size multiplier = clip(1 / ratio, min_size_mult, 1)
+    min_size_mult: float = 0.25
 
 
 @dataclass
 class RegimeConfig:
+    method: str = "hmm"  # hmm | adx
+    vol_method: str = "garch"  # garch | atr
+    hmm: HMMConfig = field(default_factory=HMMConfig)
+    garch: GARCHConfig = field(default_factory=GARCHConfig)
     adx_period: int = 14
     adx_trend: float = 25.0
     adx_range: float = 20.0
@@ -130,6 +173,53 @@ class EnsembleConfig:
     mr_max_hold_bars: int = 48
     reentry_cooldown_bars: int = 4
     weights: dict[str, dict[str, float]] = field(default_factory=_default_weights)
+
+
+@dataclass
+class SqueezeConfig:
+    """Port of the "SQZ_Breakout_Pro_NEW" Pine Script (Squeeze Momentum) combined with VWAP."""
+
+    length: int = 60
+    bb_mult: float = 2.0
+    kc_mult: float = 1.5
+    calc_mode: str = "fixed"  # fixed | dynamic | percent  (Pine: Sabit | Dinamik | Yüzdesel)
+    fixed_val: float = 0.0
+    dyn_mult: float = 2.5
+    perc_val: float = 75.0
+    vwap_anchor: str = "D"  # D (UTC day) | W (UTC week) | rolling
+    vwap_rolling_bars: int = 24
+    # LONG when close > VWAP and momentum is rising ("state") or just turned up ("turn").
+    long_trigger: str = "state"
+    # SHORT when close < VWAP and momentum just turned from rising to falling ("turn") or is falling ("state").
+    short_trigger: str = "turn"
+    confirm_bars: int = 1  # consecutive bars the momentum direction must hold (Pine "ardışık 3" = 3)
+    atr_stop_mult: float = 1.5
+    take_profit_r: float = 1.1
+    # HMM regimes in which new positions may be opened
+    tradeable_regimes: list[str] = field(default_factory=lambda: ["TREND_UP", "TREND_DOWN", "RANGE"])
+
+
+@dataclass
+class StrategyConfig:
+    name: str = "squeeze_vwap"  # squeeze_vwap | ensemble
+    squeeze: SqueezeConfig = field(default_factory=SqueezeConfig)
+
+
+@dataclass
+class LiveConfig:
+    """Real order execution on Binance USD-M futures (mode: live)."""
+
+    env: str = "demo"  # demo (Binance demo trading, fake money) | mainnet (REAL money)
+    # Required, verbatim, before any mainnet order is sent.
+    mainnet_confirm: str = ""
+    leverage: int = 2
+    margin_mode: str = "isolated"  # isolated | cross
+    place_exchange_stops: bool = True  # STOP_MARKET / TAKE_PROFIT_MARKET on the exchange as a safety net
+    sync_interval_s: float = 30.0
+    max_retries: int = 4
+
+
+MAINNET_CONFIRM_PHRASE = "GERCEK PARA ILE ISLEM YAPMAYI ONAYLIYORUM"
 
 
 @dataclass
@@ -262,6 +352,8 @@ class Config:
     regime: RegimeConfig = field(default_factory=RegimeConfig)
     signals: SignalConfig = field(default_factory=SignalConfig)
     ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
+    strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    live: LiveConfig = field(default_factory=LiveConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     costs: CostConfig = field(default_factory=CostConfig)
     walkforward: WalkForwardConfig = field(default_factory=WalkForwardConfig)
@@ -295,8 +387,36 @@ class Config:
 
     def validate(self) -> None:
         errors = []
-        if self.mode != "paper":
-            errors.append("mode: bu sürümde yalnızca 'paper' destekleniyor")
+        if self.mode not in ("paper", "live"):
+            errors.append("mode: 'paper' veya 'live' olmalı")
+        if self.mode == "live":
+            if self.live.env not in ("demo", "mainnet"):
+                errors.append("live.env: 'demo' veya 'mainnet' olmalı")
+            if self.live.env == "mainnet" and self.live.mainnet_confirm != MAINNET_CONFIRM_PHRASE:
+                errors.append(f"live.mainnet_confirm: gerçek parayla işlem için tam olarak '{MAINNET_CONFIRM_PHRASE}' yazılmalı")
+            if not 1 <= self.live.leverage <= 20:
+                errors.append("live.leverage 1-20 arasında olmalı")
+            if self.live.margin_mode not in ("isolated", "cross"):
+                errors.append("live.margin_mode: 'isolated' veya 'cross' olmalı")
+        if self.regime.method not in ("hmm", "adx"):
+            errors.append("regime.method: 'hmm' veya 'adx' olmalı")
+        if self.regime.vol_method not in ("garch", "atr"):
+            errors.append("regime.vol_method: 'garch' veya 'atr' olmalı")
+        if self.strategy.name not in ("squeeze_vwap", "ensemble"):
+            errors.append("strategy.name: 'squeeze_vwap' veya 'ensemble' olmalı")
+        sq = self.strategy.squeeze
+        if sq.calc_mode not in ("fixed", "dynamic", "percent"):
+            errors.append("strategy.squeeze.calc_mode: fixed | dynamic | percent")
+        if sq.vwap_anchor not in ("D", "W", "rolling"):
+            errors.append("strategy.squeeze.vwap_anchor: D | W | rolling")
+        if sq.long_trigger not in ("state", "turn") or sq.short_trigger not in ("state", "turn"):
+            errors.append("strategy.squeeze.long_trigger/short_trigger: state | turn")
+        if sq.take_profit_r <= 0 or sq.atr_stop_mult <= 0:
+            errors.append("strategy.squeeze: take_profit_r ve atr_stop_mult pozitif olmalı")
+        if self.account.balance_source not in ("virtual", "binance"):
+            errors.append("account.balance_source: 'virtual' veya 'binance' olmalı")
+        if self.account.binance_wallet not in ("futures", "spot"):
+            errors.append("account.binance_wallet: 'futures' veya 'spot' olmalı")
         if self.timeframe not in TIMEFRAME_MS:
             errors.append(f"timeframe: {self.timeframe} desteklenmiyor ({', '.join(TIMEFRAME_MS)})")
         if not self.symbols:
