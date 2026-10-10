@@ -110,13 +110,23 @@ canlı hesap `state/cappatrader_live_demo.sqlite` / `_live_mainnet.sqlite` için
 
 Canlı moddaki korumalar:
 - Her girişten sonra borsaya STOP_MARKET ve TAKE_PROFIT_MARKET emirleri girilir; bot kapansa da pozisyon korunur.
-  Koruma emri reddedilirse pozisyon hemen kapatılır.
+  Koruma emri reddedilirse pozisyon hemen kapatılır. Kapatma da başarısız olursa her senkronda hem koruma hem
+  kapatma yeniden denenir, ve Telegram'da borsada stop olmadığı açıkça yazılır.
+- Yeniden başlatmada koruma emirleri yenilenirken önce yeni stop konur, sonra eski emir iptal edilir. Böylece
+  pozisyon hiçbir an stopsuz kalmaz. Durdurulurken yoldaki emirlerin bitmesi 25 saniyeye kadar beklenir.
 - Bakiye her girişten önce Binance'ten okunur. Risk: kasanın yüzdesi / stop mesafesi; kaldıraç yalnızca gereken
   teminatı belirler.
 - Başlangıçta ve 30 saniyede bir pozisyonlar borsayla eşleştirilir. Borsada kapanmış pozisyon işlem kaydına
-  geçer; botun bilmediği bir pozisyon devralınır ve korunur.
+  geçer. Botun bilmediği bir pozisyon devralınır ve korunur; fiyat girişten çok uzaklaşmışsa stop ve hedef güncel
+  fiyata göre konur.
+- Kill-switch açıkken bot, tüm pozisyonlar kapanana kadar kapatmayı tekrar dener.
 - Emir zaman aşımında, tekrar denemeden önce aynı istemci kimliğiyle emir aranır; böylece çift pozisyon açılmaz.
-- Aynı hesap için ikinci bir bot başlatılamaz. `resume` ve `reset` bot çalışırken reddedilir.
+- Aynı hesap için ikinci bir bot başlatılamaz; bu, aynı `state/` klasörünü paylaşan Docker container'ları için de
+  geçerlidir. `resume` ve `reset` bot çalışırken reddedilir.
+- Gerçek parada (`mainnet`) API anahtarında para çekme yetkisi açıksa bot başlamaz; IP kısıtlaması yoksa uyarır.
+- **Bot çalışırken futures cüzdanından para çekmeyin veya transfer yapmayın.** Bot bakiyedeki düşüşü zarar sayar ve
+  kill-switch'i tetikleyip pozisyonları kapatabilir. Transferden önce botu durdurun, sonra `resume` çalıştırın;
+  zirve bakiye başlangıçta Binance'ten yeniden okunur.
 
 ### Önerilen sıra
 

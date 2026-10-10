@@ -219,7 +219,9 @@ def test_stop_during_bootstrap_exits_cleanly(live_cfg, universe, tmp_path):
 
     eng = asyncio.run(scenario())
     assert not any("başlatıldı" in m for m in eng.notifier.messages)
-    assert not (tmp_path / "s.sqlite.lock").exists()
+    from cappatrader.live.lock import running_pid
+
+    assert running_pid(live_cfg.state_db) is None  # the lock was released
 
 
 def test_removed_symbol_with_open_position_is_still_managed(live_cfg, universe, tmp_path):

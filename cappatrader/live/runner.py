@@ -105,6 +105,11 @@ class LiveEngine:
         self.entry_lock = asyncio.Lock()
         self.fit_lock = asyncio.Lock()  # model fits touch process-global state (threadpool limits, warnings)
         self.unprotected: set[str] = set()  # live positions whose exchange stop could not be placed (retried each sync)
+        self.close_retry: dict[str, str] = {}  # positions the bot failed to close: retried each sync / tick
+        # protection orders that could not be cancelled: symbol -> order ids, or None = all of a flat symbol
+        self.stale_orders: dict[str, list[str] | None] = {}
+        # exchange order ids of each position's stop / target (persisted: a restart replaces them by id)
+        self.protection_ids: dict[str, list[str]] = dict(self.store.get_kv("protection_ids") or {})
         self.inflight: set[str] = set()
         self.tasks: set[asyncio.Task] = set()
         self.protection = False
@@ -326,6 +331,9 @@ class LiveEngine:
         if sym not in self.account.positions:
             return
         self.unprotected.discard(sym)
+        self.close_retry.pop(sym, None)
+        if self.protection_ids.pop(sym, None) is not None:
+            self._save_protection_ids()
         trade = self.account.close_position(sym, fill, reason, _now().isoformat())
         if self.live and self.available is not None:
             self.account.cash = self.available
@@ -338,11 +346,21 @@ class LiveEngine:
     def _adopt(self, sym: str, side: int, qty: float, entry: float) -> Position:
         atr = self.last_atr.get(sym, 0.0) or entry * 0.01
         dist = self.rcfg.atr_stop_mult * atr
-        tp = entry + side * self.rcfg.take_profit_r * dist if self.rcfg.take_profit_r else None
+        tp_r = self.rcfg.take_profit_r
+        px = self.last_price.get(sym) or entry
+        anchor, note = entry, "Borsada bulunan sahipsiz pozisyon devralındı"
+        crossed = (px - (entry - side * dist)) * side <= 0 or (tp_r and (entry + side * tp_r * dist - px) * side <= 0)
+        if crossed:
+            # price already moved past the entry-based stop/target: protect from the current price instead
+            # of closing the position on its first tick
+            anchor = px
+            note += f" (fiyat girişten uzaklaştığı için stop/hedef güncel fiyata ({fmt.price(px)}) göre kondu)"
+        stop = anchor - side * dist
+        tp = anchor + side * tp_r * dist if tp_r else None
         pos = Position(symbol=sym, side=side, qty=qty, entry_price=entry, entry_time=_now().isoformat(),
-                       stop_price=entry - side * dist, initial_stop=entry - side * dist, risk_per_unit=dist,
+                       stop_price=stop, initial_stop=stop, risk_per_unit=dist,
                        best_price=entry, entry_regime="UNKNOWN", entry_confidence=0.0, entry_fee=0.0,
-                       entry_slippage_cost=0.0, reasons=["Borsada bulunan sahipsiz pozisyon devralındı"],
+                       entry_slippage_cost=0.0, reasons=[note],
                        take_profit=tp, style="SQZ" if is_squeeze(self.cfg) else "TREND")
         self.account.open_position(pos, self._synthetic_fill_for(sym, side, qty, entry), enforce_cash=False)
         return pos
@@ -362,20 +380,62 @@ class LiveEngine:
             for w in items:
                 self.alert("Borsa uyarısı", w)
 
+    def _exchange_protected(self, sym: str) -> bool:
+        return self.live and self.cfg.live.place_exchange_stops and sym not in self.unprotected
+
+    def _protection_text(self) -> str:
+        """What actually protects the open positions while the bot is not watching them."""
+        if not self.live or not self.account.positions:
+            return "" if self.live else "Kağıt hesapta pozisyonlar yalnızca bot çalışırken izlenir."
+        naked = [s for s in self.account.positions if not self._exchange_protected(s)]
+        if not naked:
+            return "Borsadaki stop emirleri açık pozisyonları korumaya devam ediyor."
+        return ("DİKKAT: " + ", ".join(fmt.pair(s) for s in naked) + " için borsada stop emri YOK; "
+                "botu hemen yeniden başlatın veya pozisyonu Binance'te elle koruyun.")
+
+    def _save_protection_ids(self) -> None:
+        self.store.set_kv("protection_ids", self.protection_ids)
+
+    async def _guarded(self, coro):
+        """Run an exchange action that must not be interrupted half-way (e.g. by SIGTERM): it is a tracked
+        task that shutdown waits for, and cancelling the caller does not cancel it."""
+        task = asyncio.create_task(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return await asyncio.shield(task)
+
     async def _protect(self, pos: Position) -> None:
         if not self.cfg.live.place_exchange_stops:
             return
         try:
-            await self.futures.place_protection(pos.symbol, pos.side, pos.qty, pos.stop_price, pos.take_profit)
+            ids = await self.futures.place_protection(pos.symbol, pos.side, pos.qty, pos.stop_price, pos.take_profit)
         finally:
             self._broker_warnings()
+        self.protection_ids[pos.symbol] = [str(x) for x in ids or []]
+        self._save_protection_ids()
         self.unprotected.discard(pos.symbol)
+
+    async def _swap_protection(self, pos: Position) -> None:
+        old = list(self.protection_ids.get(pos.symbol) or [])
+        if old:
+            # place the new stop/target first and only then cancel the old ones by id: never a moment
+            # without an exchange stop (reduce-only orders cannot over-close the position)
+            await self._protect(pos)
+            try:
+                await self.futures.cancel_protection(pos.symbol, old)
+            except Exception as exc:
+                self.stale_orders[pos.symbol] = old
+                log.warning("%s eski koruma emirleri iptal edilemedi (yeniden denenecek): %s", pos.symbol, exc)
+        else:  # unknown existing orders (adopted position, first start): clear the symbol, then place
+            await self.futures.cancel_protection(pos.symbol)
+            await self._protect(pos)
 
     async def _reprotect(self, pos: Position, why: str) -> None:
         """Replace the exchange stop/target; on failure keep tracking the stop locally and retry each sync."""
+        if not self.cfg.live.place_exchange_stops:
+            return
         try:
-            await self.futures.cancel_protection(pos.symbol)
-            await self._protect(pos)
+            await self._guarded(self._swap_protection(pos))
         except Exception as exc:
             first = pos.symbol not in self.unprotected
             self.unprotected.add(pos.symbol)
@@ -385,6 +445,43 @@ class LiveEngine:
                            "yerel olarak izleniyor; borsa emri her senkronda yeniden denenecek.")
             else:
                 log.warning("%s koruma emri yine yerleştirilemedi: %s", pos.symbol, exc)
+
+    async def _cancel_flat(self, sym: str) -> None:
+        """Cancel every protection order of a symbol that has just gone flat; retried each sync on failure."""
+        try:
+            await self.futures.cancel_protection(sym)
+            self.stale_orders.pop(sym, None)
+        except Exception as exc:
+            if sym not in self.stale_orders:
+                self.alert("Eski koruma emirleri iptal edilemedi",
+                           f"{fmt.pair(sym)}: {type(exc).__name__}: {exc}. Her senkronda yeniden denenecek; bu paritede "
+                           "yeni giriş, emirler temizlenene kadar açılmaz.")
+            self.stale_orders[sym] = None
+
+    async def _retry_pending(self) -> None:
+        """Retry what failed before: closes the bot wanted (safety / kill-switch), stale protection orders."""
+        for sym, ids in list(self.stale_orders.items()):
+            if sym in self.inflight or (ids is None and sym in self.account.positions):
+                continue
+            try:
+                await self.futures.cancel_protection(sym, ids) if ids else await self.futures.cancel_protection(sym)
+                self.stale_orders.pop(sym, None)
+            except Exception as exc:
+                log.warning("%s eski koruma emirleri yine iptal edilemedi: %s", sym, exc)
+        for sym, reason in list(self.close_retry.items()):
+            if sym not in self.account.positions:
+                self.close_retry.pop(sym, None)
+            elif sym not in self.inflight:
+                self._spawn(sym, self.close_position(sym, reason))
+
+    def _flatten_if_halted(self) -> None:
+        """While the kill-switch is active the book must be flat: (re)issue closes the first pass missed
+        (a symbol with an order in flight, a failed close, positions restored or adopted after a restart)."""
+        if not self.account.halted:
+            return
+        for sym in list(self.account.positions):
+            if sym not in self.inflight:
+                self._spawn(sym, self.close_position(sym, f"Kill-switch: {self.account.halt_reason}"))
 
     async def reconcile_positions(self, startup: bool = False) -> None:
         """Make the local ledger agree with the exchange: record positions the exchange closed,
@@ -402,10 +499,7 @@ class LiveEngine:
                 if fill is None:
                     fill = self._synthetic_fill(sym, -pos.side, pos.qty)
                     note = " — kapanış fiyatı bulunamadı, son fiyat kullanıldı"
-                try:
-                    await self.futures.cancel_protection(sym)
-                except Exception as exc:
-                    log.warning("%s koruma emirleri iptal edilemedi: %s", sym, exc)
+                await self._cancel_flat(sym)
                 await self._record_close(sym, fill, "Pozisyon borsada kapandı (borsa stop/hedef emri veya manuel)" + note)
             elif abs(e.qty - pos.qty) > 1e-12 * max(1.0, pos.qty):
                 log.warning("%s miktar uyuşmazlığı: yerel %s, borsa %s — borsa esas alındı", sym, pos.qty, e.qty)
@@ -462,8 +556,8 @@ class LiveEngine:
             self.protection = True
             self.alert("Veri bağlantısı koptu",
                        "WebSocket bağlantısı kesildi. Koruma modu: yeni işlem açılmıyor, açık pozisyonların stopları "
-                       "REST fiyatıyla izleniyor" + (" ve borsadaki stop emirleri yerinde" if self.live else "")
-                       + ". Otomatik yeniden bağlanılıyor.", "PROTECTION")
+                       "REST fiyatıyla izleniyor. " + self._protection_text()
+                       + " Otomatik yeniden bağlanılıyor.", "PROTECTION")
         elif connected:
             for s in list(self.symbols):
                 await self._backfill(s)
@@ -691,6 +785,13 @@ class LiveEngine:
                 log.info("%s pozisyon açılmadı: %s", sym, sz.rejected)
                 return
             if self.live:
+                try:  # a fresh position must not inherit reduce-only orders left from an earlier trade
+                    await self.futures.cancel_protection(sym)
+                    self.stale_orders.pop(sym, None)
+                except Exception as exc:
+                    log.warning("%s giriş atlandı: eski koruma emirleri temizlenemedi: %s", sym, exc)
+                    self.stale_orders[sym] = None
+                    return
                 try:
                     fill = await self.futures.market_order(sym, d.side, sz.qty, ref)
                 except Exception as exc:
@@ -716,8 +817,9 @@ class LiveEngine:
                 return
             if self.live:
                 try:
-                    await self._protect(pos)
+                    await self._guarded(self._protect(pos))
                 except Exception as exc:
+                    self.unprotected.add(sym)  # if the safety close fails too, the sync retries both
                     self.alert("Koruma emri yerleştirilemedi",
                                f"{fmt.pair(sym)} pozisyonu güvenlik için kapatılıyor: {type(exc).__name__}: {exc}")
                     await self.close_position(sym, "Borsa tarafı stop emri yerleştirilemedi (güvenlik kapanışı)")
@@ -726,6 +828,9 @@ class LiveEngine:
                     await self.refresh_balance()
                 except Exception as exc:
                     log.warning("Bakiye güncellenemedi: %s", exc)
+                if self.account.halted:  # the kill-switch fired while the stop was being placed
+                    await self.close_position(sym, "Kill-switch emir iletimi sırasında tetiklendi — pozisyon hemen kapatıldı")
+                    return
             self.notifier.notify(msg.entry_message(
                 pos, fill, d, sz.notes, self.equity(), self.cash(), self.account.starting_balance,
                 len(self.account.positions), mode=cfg.mode_label))
@@ -739,8 +844,15 @@ class LiveEngine:
             try:
                 fill = await self.futures.close_position(sym, pos.side, pos.qty, ref)
             except Exception as exc:
-                self.alert("Pozisyon kapatılamadı",
-                           f"{fmt.pair(sym)}: {type(exc).__name__}: {exc}. Borsadaki stop emri pozisyonu korumaya devam ediyor.")
+                first = sym not in self.close_retry
+                self.close_retry[sym] = reason
+                guard = ("Borsadaki stop emri pozisyonu korumaya devam ediyor" if self._exchange_protected(sym) else
+                         "DİKKAT: borsada stop emri YOK, stop yalnızca bot tarafından izleniyor")
+                if first:
+                    self.alert("Pozisyon kapatılamadı", f"{fmt.pair(sym)}: {type(exc).__name__}: {exc}. {guard}; "
+                               "kapatma her senkronda yeniden denenecek.")
+                else:
+                    log.warning("%s yine kapatılamadı: %s", sym, exc)
                 return
             finally:
                 self._broker_warnings()
@@ -749,10 +861,7 @@ class LiveEngine:
                 reason = f"{reason} (pozisyon borsada zaten kapanmıştı)"
                 if fill is None:
                     fill = self._synthetic_fill(sym, -pos.side, pos.qty)
-            try:
-                await self.futures.cancel_protection(sym)
-            except Exception as exc:
-                log.warning("%s koruma emirleri iptal edilemedi: %s", sym, exc)
+            await self._cancel_flat(sym)
             try:
                 await self.refresh_balance()
             except Exception as exc:
@@ -805,9 +914,11 @@ class LiveEngine:
                 try:
                     await self.refresh_balance()
                     await self.reconcile_positions()
+                    await self._retry_pending()
                 except Exception as exc:
                     log.warning("Borsa senkronizasyonu başarısız: %s", exc)
             await self.check_guards()
+            self._flatten_if_halted()
             if self.dirty:
                 self.store.save_account(self.account)
                 self.dirty = False
@@ -898,7 +1009,7 @@ class LiveEngine:
                 self.notifier.notify(msg.alert_message(
                     "Bot beklenmedik şekilde durdu",
                     f"'{t.get_name()}' görevi çöktü: {type(t.exception()).__name__}: {t.exception()}. "
-                    + ("Borsadaki stop emirleri açık pozisyonları korumaya devam ediyor. " if self.live else "")
+                    + self._protection_text() + " "
                     + "Botu yeniden başlatın."))
         self.stop_event.set()
         stopper.cancel()
@@ -909,9 +1020,11 @@ class LiveEngine:
 
     async def shutdown(self, send_message: bool = True) -> None:
         """Best effort: every step runs even if an earlier one fails."""
-        if self.tasks:
+        unfinished = 0
+        if self.tasks:  # orders in flight must finish (fill -> stop placed); docker compose grants 30 s
             try:
-                await asyncio.wait(list(self.tasks), timeout=10)
+                _, pending = await asyncio.wait(list(self.tasks), timeout=25)
+                unfinished = len(pending)
             except Exception as exc:
                 log.error("Açık emir görevleri beklenemedi: %s", exc)
         try:
@@ -922,8 +1035,10 @@ class LiveEngine:
             self.notifier.notify(msg.alert_message(
                 "CappaTrader durduruldu",
                 f"Bakiye {self.equity():,.2f} USDT, açık pozisyon {len(self.account.positions)} "
-                "(pozisyonlar kayıtlı; yeniden başlatınca takip devam eder"
-                + ("; borsadaki stop emirleri yerinde" if self.live else "") + ")."))
+                "(pozisyonlar kayıtlı; yeniden başlatınca takip devam eder)."
+                + (f" {self._protection_text()}" if self.account.positions else "")
+                + (f" DİKKAT: {unfinished} emir görevi bitmeden durduruldu; borsadaki pozisyonları kontrol edin."
+                   if unfinished else "")))
         for name, closer in (("telegram", self.notifier.stop), ("rest", self.rest.close)):
             try:
                 await closer()
