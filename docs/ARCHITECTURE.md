@@ -53,9 +53,12 @@ hesap veya Binance USD-M futures'tur.
 ## Bir bar kapandığında (canlı)
 
 1. `kline` mesajı `x=true` ile gelir → `LiveEngine.on_kline` barı ekler, eksik bar varsa REST ile tamamlar, temizler.
-2. Online HMM ve GARCH (ensemble'da ayrıca ML) backtest'le aynı barlarda yeniden eğitilir. Yeniden eğitim takvimi
-   zamana sabitlidir (`zaman damgası // (bar × retrain_every)`). Eğitim, puanlanan bardan önceki barlarla ve bir
-   thread'de yapılır. Son bar için HMM durumu ileri filtrelemeyle, GARCH tahmini özyinelemeyle hesaplanır.
+2. Online HMM ve GARCH backtest'le aynı barlarda yeniden eğitilir. Yeniden eğitim takvimi zamana sabitlidir
+   (`zaman damgası // (bar × retrain_every)`). Eğitim, o dilimden önceki barlarla ve bir thread'de yapılır; bir veri
+   kesintisi dilimin ilk barını yutsa bile aynı pencere kullanılır. Son bar için HMM durumu ileri filtrelemeyle,
+   GARCH tahmini özyinelemeyle hesaplanır. Yalnızca ensemble stratejisinin kullandığı ML modeli bu takvime bağlı
+   değildir. Bot başladığından beri her `retrain_every` barda bir eğitilir, bu yüzden ML oyu canlıda backtest'tekinden
+   biraz farklı olabilir.
 3. Emir defteri + işlem akışından `orderflow`, funding/F&G/haberden `sentiment` skoru alınır.
 4. `prepare_universe` (sembol + pairs ortakları) → `strategy/factory.decide` (Squeeze/VWAP veya ensemble).
 5. Giriş onaylanırsa `size_position` → kağıt hesapta `PaperBroker.market_order` (gecikme kadar bekler, defterde

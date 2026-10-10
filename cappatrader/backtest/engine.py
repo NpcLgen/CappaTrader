@@ -130,25 +130,33 @@ class Backtester:
         delay = max(int(cfg.costs.execution_delay_bars), 0)
 
         for k, ts in enumerate(master):
-            # 1. open-of-bar execution and intrabar risk
+            # 1a. open-of-bar execution for every symbol first: orders decided at the previous close are
+            # sized with the account as it was then (live places them before any of this bar's ticks),
+            # never with cash or trades that another symbol's stop releases later inside this bar.
+            # Exits go first, as their fills free the cash the entries are sized with.
+            due = [(s, lookup[s].get(ts)) for s in symbols if lookup[s].get(ts) is not None
+                   and s in pending and k >= pending[s]["exec_k"]]
+            due.sort(key=lambda x: pending[x[0]]["kind"] != "exit")
+            for s, i in due:
+                p = pending.pop(s)
+                v = views[s]
+                o = v["open"][i]
+                if p["kind"] == "exit" and s in acct.positions:
+                    self._close(acct, s, o, v, i, ts, p["reason"])
+                    last_exit_k[s] = k
+                    rev = p.get("reverse")
+                    others = sum(1 for q in pending.values() if q["kind"] == "enter")
+                    if rev is not None and self.risk.entry_allowed(acct, s, ts, others)[0]:
+                        self._open(acct, s, o, v, i, ts, rev["decision"], rev["reasons"], last)
+                elif p["kind"] == "enter" and s not in acct.positions and not acct.halted:
+                    self._open(acct, s, o, v, i, ts, p["decision"], p["reasons"], last)
+            # 1b. intrabar risk
             for s in symbols:
                 i = lookup[s].get(ts)
                 if i is None:
                     continue
                 v = views[s]
                 o, h, l, c = v["open"][i], v["high"][i], v["low"][i], v["close"][i]
-                p = pending.get(s)
-                if p is not None and k >= p["exec_k"]:
-                    del pending[s]
-                    if p["kind"] == "exit" and s in acct.positions:
-                        self._close(acct, s, o, v, i, ts, p["reason"])
-                        last_exit_k[s] = k
-                        rev = p.get("reverse")
-                        others = sum(1 for q in pending.values() if q["kind"] == "enter")
-                        if rev is not None and self.risk.entry_allowed(acct, s, ts, others)[0]:
-                            self._open(acct, s, o, v, i, ts, rev["decision"], rev["reasons"], last)
-                    elif p["kind"] == "enter" and s not in acct.positions and not acct.halted:
-                        self._open(acct, s, o, v, i, ts, p["decision"], p["reasons"], last)
                 pos = acct.positions.get(s)
                 if pos is not None:
                     ref = stop_hit(pos, o, h, l)

@@ -224,3 +224,32 @@ def test_walk_forward_keeps_positions_across_oos_windows(cfg, universe):
     last_oos_end = res.windows[-1].oos_end
     assert all(pd.Timestamp(t.exit_time) >= pd.Timestamp(last_oos_end) - pd.Timedelta(hours=1) for t in forced)
     assert len(forced) <= len(universe)
+
+
+def test_open_orders_fill_before_any_intrabar_exit_of_the_same_bar(cfg, universe, monkeypatch):
+    # Orders decided at the previous close must be sized with the account as it was then (as live does),
+    # never with cash or Kelly history released by another symbol's stop later inside the same bar.
+    c = cfg.with_overrides({"account.allow_short": True, "risk.max_drawdown": 0.99, "risk.daily_loss_limit": 1.0})
+    frames = prepare_universe(universe, c)
+    bt = Backtester(c)
+    log = []
+    o_open, o_close = bt._open, bt._close
+
+    def spy_open(acct, s, ref, v, i, ts, d, reasons, last):
+        log.append((ts, "open", acct.cash, len(acct.trades)))
+        return o_open(acct, s, ref, v, i, ts, d, reasons, last)
+
+    def spy_close(acct, s, ref, v, i, ts, reason):
+        intrabar = reason.startswith(("Zarar-kes", "Hedef kâr", "İzleyen stop"))
+        log.append((ts, "intrabar" if intrabar else "open-exit", acct.cash, len(acct.trades)))
+        return o_close(acct, s, ref, v, i, ts, reason)
+
+    bt._open, bt._close = spy_open, spy_close
+    bt.run(frames, collect_reasons=False)
+    seen_intrabar, mixed = set(), 0
+    for ts, kind, _, _ in log:
+        if kind == "intrabar":
+            seen_intrabar.add(ts)
+        elif ts in seen_intrabar:
+            mixed += 1
+    assert len({ts for ts, *_ in log}) > 50 and mixed == 0
