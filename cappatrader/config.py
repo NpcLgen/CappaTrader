@@ -59,6 +59,9 @@ class ExchangeConfig:
     rest_base: str = "https://api.binance.com"
     ws_base: str = "wss://stream.binance.com:9443"
     futures_rest_base: str = "https://fapi.binance.com"
+    futures_ws_base: str = "wss://fstream.binance.com"
+    # Market data source for paper trading: spot or USD-M futures. Live mode always uses futures.
+    market_data: str = "spot"
     recv_window_ms: int = 5000
     request_timeout_s: float = 10.0
     max_weight_per_minute: int = 6000
@@ -266,11 +269,13 @@ class WalkForwardConfig:
     oos_bars: int = 1000
     objective: str = "sharpe"
     min_trades: int = 5
+    # Default grid targets the default squeeze_vwap strategy. For strategy "ensemble" use e.g.
+    # {"signals.ema_fast": [12, 20], "signals.ema_slow": [50, 100], "risk.atr_stop_mult": [1.5, 2.5],
+    #  "ensemble.entry_confidence": [60, 65, 75]}.
     grid: dict[str, list[Any]] = field(default_factory=lambda: {
-        "signals.ema_fast": [12, 20],
-        "signals.ema_slow": [50, 100],
-        "risk.atr_stop_mult": [1.5, 2.5],
-        "ensemble.entry_confidence": [60, 65, 75],
+        "strategy.squeeze.atr_stop_mult": [1.0, 1.5, 2.0],
+        "strategy.squeeze.confirm_bars": [1, 2],
+        "strategy.squeeze.length": [30, 60],
     })
 
 
@@ -364,6 +369,24 @@ class Config:
     secrets: Secrets = field(default_factory=Secrets, repr=False)
 
     @property
+    def state_db(self) -> str:
+        """Paper and live (demo / mainnet) accounts never share a state database."""
+        if self.mode != "live":
+            return self.runtime.state_db
+        p = Path(self.runtime.state_db)
+        return str(p.with_name(f"{p.stem}_live_{self.live.env}{p.suffix}"))
+
+    @property
+    def mode_label(self) -> str:
+        if self.mode != "live":
+            return "KAĞIT HESAP"
+        return "CANLI · DEMO (sanal para)" if self.live.env == "demo" else "CANLI · GERÇEK PARA"
+
+    @property
+    def data_market(self) -> str:
+        return "futures" if self.mode == "live" else self.exchange.market_data
+
+    @property
     def bar_ms(self) -> int:
         return TIMEFRAME_MS[self.timeframe]
 
@@ -398,6 +421,8 @@ class Config:
                 errors.append("live.leverage 1-20 arasında olmalı")
             if self.live.margin_mode not in ("isolated", "cross"):
                 errors.append("live.margin_mode: 'isolated' veya 'cross' olmalı")
+        if self.exchange.market_data not in ("spot", "futures"):
+            errors.append("exchange.market_data: 'spot' veya 'futures' olmalı")
         if self.regime.method not in ("hmm", "adx"):
             errors.append("regime.method: 'hmm' veya 'adx' olmalı")
         if self.regime.vol_method not in ("garch", "atr"):

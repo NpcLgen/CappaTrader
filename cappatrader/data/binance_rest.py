@@ -1,4 +1,4 @@
-"""Async Binance REST client (spot market data, futures funding, key permissions).
+"""Async Binance REST client (spot or USD-M futures market data, funding, key permissions).
 
 Market data endpoints are public. The API key is only used for the read-only
 /sapi/v1/account/apiRestrictions check (PRD: withdrawals must be disabled).
@@ -23,6 +23,11 @@ from cappatrader.config import TIMEFRAME_MS, ExchangeConfig, Secrets
 from cappatrader.data.cleaning import klines_to_frame
 
 log = logging.getLogger(__name__)
+
+
+def _min_notional(flt: dict) -> float:
+    # spot: NOTIONAL.minNotional / MIN_NOTIONAL.minNotional; futures: MIN_NOTIONAL.notional
+    return float(flt.get("minNotional") or flt.get("notional") or 0)
 
 
 class BinanceAPIError(RuntimeError):
@@ -54,8 +59,20 @@ class WeightLimiter:
 
 
 class BinanceREST:
-    def __init__(self, cfg: ExchangeConfig, secrets: Secrets | None = None, session: aiohttp.ClientSession | None = None):
+    def __init__(self, cfg: ExchangeConfig, secrets: Secrets | None = None, session: aiohttp.ClientSession | None = None,
+                 market: str = "spot"):
+        if market not in ("spot", "futures"):
+            raise ValueError("market: 'spot' veya 'futures'")
         self.cfg = cfg
+        self.market = market
+        fut = market == "futures"
+        self._data_base = cfg.futures_rest_base if fut else cfg.rest_base
+        self._paths = {
+            "ping": "/fapi/v1/ping" if fut else "/api/v3/ping",
+            "klines": "/fapi/v1/klines" if fut else "/api/v3/klines",
+            "exchangeInfo": "/fapi/v1/exchangeInfo" if fut else "/api/v3/exchangeInfo",
+            "ticker": "/fapi/v1/ticker/price" if fut else "/api/v3/ticker/price",
+        }
         self.secrets = secrets or Secrets()
         self._session = session
         self._own_session = session is None
@@ -97,6 +114,8 @@ class BinanceREST:
                     self.limiter.observe(resp.headers.get("X-MBX-USED-WEIGHT-1M"))
                     if resp.status in (418, 429):
                         retry_after = float(resp.headers.get("Retry-After", "60"))
+                        if attempt >= retries or retry_after > 300:  # 418 = IP ban, can last hours
+                            raise BinanceAPIError(resp.status, f"rate limit / IP yasağı, Retry-After {retry_after:.0f} sn")
                         log.error("Binance rate limit (%s), %.0f sn bekleniyor", resp.status, retry_after)
                         await asyncio.sleep(retry_after)
                         continue
@@ -115,7 +134,7 @@ class BinanceREST:
 
     # -- spot market data ------------------------------------------------
     async def ping(self) -> bool:
-        await self._get(self.cfg.rest_base, "/api/v3/ping")
+        await self._get(self._data_base, self._paths["ping"])
         return True
 
     async def klines(self, symbol: str, interval: str, start_ms: int | None = None, end_ms: int | None = None,
@@ -125,7 +144,8 @@ class BinanceREST:
             params["startTime"] = int(start_ms)
         if end_ms is not None:
             params["endTime"] = int(end_ms)
-        return await self._get(self.cfg.rest_base, "/api/v3/klines", params, weight=2)
+        weight = 5 if self.market == "futures" else 2  # futures: weight 5 for limit 500-1000
+        return await self._get(self._data_base, self._paths["klines"], params, weight=weight)
 
     async def recent_klines(self, symbol: str, interval: str, n_bars: int) -> pd.DataFrame:
         """The last n closed bars (the still-forming bar is dropped)."""
@@ -158,22 +178,30 @@ class BinanceREST:
         return df
 
     async def exchange_filters(self, symbols: list[str]) -> dict[str, dict[str, float]]:
-        data = await self._get(self.cfg.rest_base, "/api/v3/exchangeInfo",
-                               {"symbols": json.dumps(symbols, separators=(",", ":"))}, weight=20)
+        if self.market == "futures":
+            # The futures endpoint has no symbols filter: fetch all, keep perpetual contracts we trade.
+            data = await self._get(self._data_base, self._paths["exchangeInfo"], weight=1)
+            wanted = set(symbols)
+            rows = [s for s in data.get("symbols", [])
+                    if s.get("symbol") in wanted and s.get("contractType", "PERPETUAL") == "PERPETUAL"]
+        else:
+            data = await self._get(self._data_base, self._paths["exchangeInfo"],
+                                   {"symbols": json.dumps(symbols, separators=(",", ":"))}, weight=20)
+            rows = data.get("symbols", [])
         out = {}
-        for s in data.get("symbols", []):
+        for s in rows:
             f = {x["filterType"]: x for x in s.get("filters", [])}
             out[s["symbol"]] = {
                 "step_size": float(f.get("LOT_SIZE", {}).get("stepSize", 0) or 0),
                 "min_qty": float(f.get("LOT_SIZE", {}).get("minQty", 0) or 0),
                 "tick_size": float(f.get("PRICE_FILTER", {}).get("tickSize", 0) or 0),
-                "min_notional": float((f.get("NOTIONAL") or f.get("MIN_NOTIONAL") or {}).get("minNotional", 0) or 0),
+                "min_notional": float(_min_notional(f.get("NOTIONAL") or f.get("MIN_NOTIONAL") or {})),
                 "status": s.get("status", ""),
             }
         return out
 
     async def ticker_price(self, symbol: str) -> float:
-        data = await self._get(self.cfg.rest_base, "/api/v3/ticker/price", {"symbol": symbol}, weight=2)
+        data = await self._get(self._data_base, self._paths["ticker"], {"symbol": symbol}, weight=2)
         return float(data["price"])
 
     # -- futures (alternative data) ----------------------------------------

@@ -1,14 +1,18 @@
-"""Live paper-trading engine.
+"""Live engine: paper trading on real market data, or real orders on Binance USD-M futures.
 
-WebSocket ticks/depth/klines -> cleaning -> (on bar close) pipeline + ML + order
-flow + sentiment -> decision -> risk -> paper broker -> SQLite + Telegram.
-Stops, trailing stops and the flash-move guard run on every tick.
+WebSocket ticks/depth/klines -> cleaning -> (on bar close) online HMM + GARCH + pipeline
+-> strategy decision (squeeze-VWAP or ensemble) -> risk -> broker -> SQLite + Telegram.
+Stops, take-profits, trailing stops (ensemble only) and the flash-move guard run on
+every tick. In live mode the exchange also holds STOP_MARKET / TAKE_PROFIT_MARKET
+orders, balances come from Binance, and positions are reconciled with the exchange
+at startup and every `live.sync_interval_s`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import signal
 import time
 from collections import deque
@@ -28,69 +32,118 @@ from cappatrader.execution.costs import CostModel
 from cappatrader.execution.orders import build_position
 from cappatrader.execution.paper import PaperBroker
 from cappatrader.features.indicators import atr as atr_ind
+from cappatrader.live.lock import RunLock
 from cappatrader.live.state import StateStore
-from cappatrader.models import LONG, Decision
+from cappatrader.models import LONG, Decision, Fill, Position
 from cappatrader.notify import messages as msg
 from cappatrader.notify.telegram import TelegramNotifier
 from cappatrader.risk.manager import RiskManager
 from cappatrader.risk.sizing import size_position
 from cappatrader.risk.stops import stop_reason, update_trailing
 from cappatrader.signals.ml import OnlineModel
-from cappatrader.strategy.decision import DecisionEngine, FrameView
-from cappatrader.strategy.explain import explain
+from cappatrader.strategy.decision import FrameView
+from cappatrader.strategy.factory import (decide, explain_decision, is_squeeze, make_decider, strategy_risk,
+                                          uses_trailing)
 from cappatrader.strategy.pipeline import prepare_universe
 
 log = logging.getLogger(__name__)
+
+HMM_COLS = ["hmm_state", "hmm_label", "hmm_prob"]
+GARCH_COLS = ["garch_vol", "garch_longrun", "garch_ratio", "garch_size_mult"]
 
 
 def _now() -> pd.Timestamp:
     return pd.Timestamp.now(tz="UTC")
 
 
+def _ms(ts: str | pd.Timestamp) -> int:
+    return int(pd.Timestamp(ts).value // 1_000_000)
+
+
 class LiveEngine:
     def __init__(self, cfg: Config, rest: BinanceREST | None = None, notifier: TelegramNotifier | None = None,
-                 store: StateStore | None = None, http: aiohttp.ClientSession | None = None):
+                 store: StateStore | None = None, http: aiohttp.ClientSession | None = None, futures=None):
         self.cfg = cfg
-        self.rest = rest or BinanceREST(cfg.exchange, cfg.secrets)
+        self.live = cfg.mode == "live"
+        self.market = cfg.data_market
+        self.rest = rest or BinanceREST(cfg.exchange, cfg.secrets, market=self.market)
         self.notifier = notifier or TelegramNotifier(
             cfg.secrets.telegram_token, cfg.secrets.telegram_chat_id,
             enabled=cfg.telegram.enabled, min_interval_s=cfg.telegram.min_interval_s)
-        self.store = store or StateStore(cfg.runtime.state_db)
+        self.store = store or StateStore(cfg.state_db)
+        self._fresh_account = not self.store.has_account()
         self.account = self.store.load_account(cfg.account.starting_balance)
         self.costs = CostModel(cfg.costs, cfg.bar_ms)
-        self.risk = RiskManager(cfg.risk)
-        self.decider = DecisionEngine(cfg)
+        self.rcfg = strategy_risk(cfg)
+        self.risk = RiskManager(self.rcfg)
+        self.decider = make_decider(cfg)
+        self.trailing = uses_trailing(cfg)
         self.symbols = list(cfg.symbols)
+        for s in self.account.positions:  # a position restored for a symbol removed from the config
+            if s not in self.symbols:
+                self.symbols.append(s)
         self.bars: dict[str, pd.DataFrame] = {}
         self.books = {s: OrderBook(s) for s in self.symbols}
         self.flow = {s: TradeFlow() for s in self.symbols}
         self.spoof = {s: SpoofDetector() for s in self.symbols}
         self.ticks = {s: TickFilter(max_dev=cfg.data.tick_max_deviation) for s in self.symbols}
         self.flash = {s: deque() for s in self.symbols}
+        self.use_ml = cfg.signals.ml.enabled and not is_squeeze(cfg)  # ML only votes in the ensemble
         self.ml = {s: OnlineModel(cfg.signals.ml) for s in self.symbols}
+        self.hmm = self._online("hmm") if cfg.regime.method == "hmm" else {}
+        self.garch = self._online("garch") if cfg.regime.vol_method == "garch" else {}
         self.last_price: dict[str, float] = {}
         self.last_seen: dict[str, float] = {}
         self.last_atr: dict[str, float] = {}
         self.filters: dict[str, dict] = {}
         self.alt = AltDataHub(self.rest, cfg.data.news_feeds, self.symbols) if cfg.data.alt_data_enabled else None
         self.broker = PaperBroker(self.costs, self.books, self.last_price)
+        self.futures = futures
+        self.wallet: float | None = None
+        self.available: float | None = None
+        self.binance_balance_note = ""
         self.entry_lock = asyncio.Lock()
         self.inflight: set[str] = set()
         self.tasks: set[asyncio.Task] = set()
         self.protection = False
+        self.ws_connected = False
+        self.last_eval: dict[str, pd.Timestamp] = {}
+        self.pending_entries: set[str] = set()
+        self.manage_only: set[str] = set()  # symbols tracked only because an open position needs its stop
         self.warnings: list[str] = []
         self.dirty = False
-        self.max_bars = max(cfg.runtime.history_bars, cfg.signals.ml.train_bars + 300)
+        self.crashed = False
+        hm, gc = cfg.regime.hmm, cfg.regime.garch
+        self.max_bars = max(cfg.runtime.history_bars, cfg.signals.ml.train_bars + 300,
+                            hm.train_bars + hm.feature_window + 100, gc.train_bars + 100,
+                            cfg.strategy.squeeze.length * 3 + 50)
         self.stop_event: asyncio.Event | None = None
+        self.lock = RunLock(cfg.state_db)
         self._http = http
         self._last_alt = 0.0
         self._last_equity_rec = 0.0
         self._last_heartbeat = 0.0
+        self._last_sync = 0.0
         self._summary_day: str | None = None
+
+    def _online(self, kind: str) -> dict:
+        if kind == "hmm":
+            from cappatrader.regime.hmm import OnlineHMM
+
+            return {s: OnlineHMM(self.cfg.regime.hmm) for s in self.symbols}
+        from cappatrader.regime.garch import OnlineGARCH
+
+        return {s: OnlineGARCH(self.cfg.regime.garch) for s in self.symbols}
 
     # -- helpers -----------------------------------------------------------
     def equity(self) -> float:
+        if self.live and self.wallet is not None:
+            return self.wallet + sum(p.unrealized(self.last_price.get(s, p.entry_price))
+                                     for s, p in self.account.positions.items())
         return self.account.equity(self.last_price)
+
+    def cash(self) -> float:
+        return self.available if (self.live and self.available is not None) else self.account.cash
 
     def alert(self, title: str, text: str, kind: str = "ALERT") -> None:
         log.warning("%s: %s", title, text)
@@ -110,6 +163,7 @@ class LiveEngine:
             self.inflight.discard(sym)
             if not t.cancelled() and t.exception() is not None:
                 log.error("Emir görevi hata verdi (%s)", sym, exc_info=t.exception())
+                self.alert("Emir görevi hata verdi", f"{fmt.pair(sym)}: {type(t.exception()).__name__}: {t.exception()}")
 
         task.add_done_callback(done)
 
@@ -119,14 +173,31 @@ class LiveEngine:
             return None
         return float(df["quote_volume"].iloc[-1])
 
+    def _mark_manage_only(self) -> None:
+        for s in self.symbols:
+            if s not in self.cfg.symbols:
+                self.manage_only.add(s)
+                self.warnings.append(f"{fmt.pair(s)} ayarlarda yok ama açık pozisyonu var: yalnızca stop/hedef takibi "
+                                     "yapılıyor, yeni işlem açılmayacak")
+
+    def _drop_symbol(self, sym: str, why: str) -> None:
+        if sym in self.symbols and sym not in self.account.positions:
+            self.symbols.remove(sym)
+            self.warnings.append(f"{fmt.pair(sym)} devre dışı: {why}")
+
     # -- bootstrap -----------------------------------------------------------
     async def bootstrap(self) -> None:
         cfg = self.cfg
+        self._mark_manage_only()
         try:
             self.filters = await self.rest.exchange_filters(self.symbols)
         except Exception as exc:  # filters only refine rounding; keep going
             self.warnings.append(f"Borsa filtreleri alınamadı ({type(exc).__name__}); miktar yuvarlama kapalı")
-        for s in self.symbols:
+        if self.filters:
+            market = "USD-M futures" if self.market == "futures" else "spot"
+            for s in [s for s in self.symbols if s not in self.filters]:
+                self._drop_symbol(s, f"Binance {market} piyasasında bulunamadı")
+        for s in list(self.symbols):
             status = self.filters.get(s, {}).get("status")
             if status and status != "TRADING":
                 self.warnings.append(f"{fmt.pair(s)} borsada işlem durumunda değil ({status})")
@@ -139,11 +210,21 @@ class LiveEngine:
             self.last_seen[s] = time.monotonic()
             self.last_atr[s] = float(atr_ind(df["high"], df["low"], df["close"], cfg.regime.atr_period).iloc[-1])
             log.info("%s: %d bar yüklendi (%s)", s, len(df), rep)
-        if cfg.signals.ml.enabled:
-            for s in self.symbols:
+        for s in self.symbols:
+            if self.use_ml:
                 ok = await asyncio.to_thread(self.ml[s].fit, self.bars[s])
                 log.info("%s ML modeli %s", s, "eğitildi" if ok else "eğitilemedi (yetersiz veri)")
-        await self._check_api_key()
+            if s in self.hmm:
+                ok = await asyncio.to_thread(self.hmm[s].fit, self.bars[s])
+                log.info("%s HMM rejim modeli %s", s, "eğitildi" if ok else "eğitilemedi (yetersiz veri)")
+            if s in self.garch:
+                ok = await asyncio.to_thread(self.garch[s].fit, self.bars[s])
+                log.info("%s GARCH modeli %s", s, "eğitildi" if ok else "eğitilemedi (yetersiz veri)")
+        if self.live:
+            await self._connect_futures()
+        else:
+            await self._check_api_key()
+            await self._seed_paper_balance()
         if self.alt is not None:
             await self.alt.refresh(await self.http())
             self._last_alt = time.time()
@@ -161,13 +242,150 @@ class LiveEngine:
             self.warnings.append("API anahtarında PARA ÇEKME yetkisi AÇIK — Binance'te hemen kapatın (PRD güvenlik)")
         if not r.get("ipRestrict"):
             self.warnings.append("API anahtarında IP kısıtlaması yok — sunucu IP'sine kısıtlamanız önerilir")
-        if r.get("enableSpotAndMarginTrading") or r.get("enableFutures"):
+        if not self.live and (r.get("enableSpotAndMarginTrading") or r.get("enableFutures")):
             self.warnings.append("API anahtarında işlem yetkisi açık; paper mod için yalnızca okuma yetkisi yeterli")
+
+    async def _seed_paper_balance(self) -> None:
+        """balance_source "binance": a brand-new paper account starts from the real Binance balance."""
+        if self.cfg.account.balance_source != "binance":
+            return
+        from cappatrader.execution.binance_futures import fetch_binance_balance
+
+        try:
+            bal = await fetch_binance_balance(self.cfg)
+        except Exception as exc:
+            self.warnings.append(f"Binance bakiyesi okunamadı ({type(exc).__name__}: {exc}); sanal bakiye kullanılıyor")
+            return
+        wallet = self.cfg.account.binance_wallet
+        self.binance_balance_note = f"Binance {wallet} bakiyesi: {fmt.usd(bal)}"
+        fresh = self._fresh_account or (not self.account.trades and not self.account.positions)
+        if fresh and bal > 0:
+            self._reset_account_balance(bal)
+            log.info("Kağıt hesap Binance bakiyesiyle başlatıldı: %.2f USDT", bal)
+
+    def _reset_account_balance(self, balance: float) -> None:
+        a = self.account
+        a.starting_balance = a.cash = a.peak_equity = a.day_start_equity = float(balance)
+        self.store.save_account(a)
+
+    async def _connect_futures(self) -> None:
+        if self.futures is None:
+            from cappatrader.execution.binance_futures import BinanceFuturesBroker
+
+            self.futures = BinanceFuturesBroker(self.cfg)
+        await self.futures.connect()
+        unavailable = getattr(self.futures, "unavailable", None) or {}
+        reasons = unavailable if isinstance(unavailable, dict) else {}
+        for s in list(unavailable):
+            self._drop_symbol(s, reasons.get(s) or "Binance USD-M futures'ta işlem görmüyor")
+        for w in getattr(self.futures, "warnings", None) or []:
+            if not any(fmt.pair(s) in w for s in unavailable):  # dropped symbols are already reported
+                self.warnings.append(w)
+        await self.refresh_balance()
+        if self._fresh_account and not self.account.positions:
+            self._reset_account_balance(self.equity())
+        self.binance_balance_note = (f"Binance futures: cüzdan {fmt.usd(self.wallet or 0)}, "
+                                     f"kullanılabilir {fmt.usd(self.available or 0)}")
+        await self.reconcile_positions(startup=True)
+
+    async def refresh_balance(self) -> None:
+        bal = await self.futures.balance()
+        self.wallet, self.available = float(bal.wallet), float(bal.available)
+        self.account.cash = self.available
 
     async def http(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
             self._http = aiohttp.ClientSession(trust_env=True)
         return self._http
+
+    # -- exchange reconciliation (live) ------------------------------------------
+    def _synthetic_fill(self, sym: str, side: int, qty: float) -> Fill:
+        px = self.last_price.get(sym) or self.account.positions[sym].entry_price
+        return Fill(symbol=sym, side=side, qty=qty, price=px, ref_price=px, fee=0.0, slippage_bps=0.0,
+                    latency_ms=0.0, timestamp=_now())
+
+    async def _record_close(self, sym: str, fill: Fill, reason: str) -> None:
+        if sym not in self.account.positions:
+            return
+        trade = self.account.close_position(sym, fill, reason, _now().isoformat())
+        if self.live and self.available is not None:
+            self.account.cash = self.available
+        self.store.record_trade(trade)
+        self.store.save_account(self.account)
+        self.notifier.notify(msg.exit_message(
+            trade, fill, self.equity(), self.cash(), self.account.starting_balance,
+            len(self.account.positions), self.account.trades, mode=self.cfg.mode_label))
+
+    def _adopt(self, sym: str, side: int, qty: float, entry: float) -> Position:
+        atr = self.last_atr.get(sym, 0.0) or entry * 0.01
+        dist = self.rcfg.atr_stop_mult * atr
+        tp = entry + side * self.rcfg.take_profit_r * dist if self.rcfg.take_profit_r else None
+        pos = Position(symbol=sym, side=side, qty=qty, entry_price=entry, entry_time=_now().isoformat(),
+                       stop_price=entry - side * dist, initial_stop=entry - side * dist, risk_per_unit=dist,
+                       best_price=entry, entry_regime="UNKNOWN", entry_confidence=0.0, entry_fee=0.0,
+                       entry_slippage_cost=0.0, reasons=["Borsada bulunan sahipsiz pozisyon devralındı"],
+                       take_profit=tp, style="SQZ" if is_squeeze(self.cfg) else "TREND")
+        self.account.open_position(pos, self._synthetic_fill_for(sym, side, qty, entry), enforce_cash=False)
+        return pos
+
+    @staticmethod
+    def _synthetic_fill_for(sym: str, side: int, qty: float, price: float) -> Fill:
+        return Fill(symbol=sym, side=side, qty=qty, price=price, ref_price=price, fee=0.0, slippage_bps=0.0,
+                    latency_ms=0.0, timestamp=_now())
+
+    async def _protect(self, pos: Position) -> None:
+        if not self.cfg.live.place_exchange_stops:
+            return
+        await self.futures.place_protection(pos.symbol, pos.side, pos.qty, pos.stop_price, pos.take_profit)
+
+    async def reconcile_positions(self, startup: bool = False) -> None:
+        """Make the local ledger agree with the exchange: record positions the exchange closed,
+        adopt exchange positions the bot does not know (no orphan positions, PRD §6)."""
+        ex = await self.futures.positions()
+        for sym, pos in list(self.account.positions.items()):
+            if sym in self.inflight:
+                continue
+            e = ex.get(sym)
+            if e is None or e.side != pos.side:
+                fill = await self.futures.last_close_fill(sym, _ms(pos.entry_time), pos.side)
+                note = ""
+                if fill is None:
+                    fill = self._synthetic_fill(sym, -pos.side, pos.qty)
+                    note = " — kapanış fiyatı bulunamadı, son fiyat kullanıldı"
+                try:
+                    await self.futures.cancel_protection(sym)
+                except Exception as exc:
+                    log.warning("%s koruma emirleri iptal edilemedi: %s", sym, exc)
+                await self._record_close(sym, fill, "Pozisyon borsada kapandı (borsa stop/hedef emri veya manuel)" + note)
+            elif abs(e.qty - pos.qty) > 1e-12 * max(1.0, pos.qty):
+                log.warning("%s miktar uyuşmazlığı: yerel %s, borsa %s — borsa esas alındı", sym, pos.qty, e.qty)
+                pos.qty = e.qty
+                self.dirty = True
+        for sym, e in ex.items():
+            if sym in self.account.positions or sym in self.inflight:
+                continue
+            if sym not in self.symbols:
+                self.alert("Yönetilmeyen pozisyon",
+                           f"Borsada {fmt.pair(sym)} pozisyonu var ama ayarlarda bu parite yok; bot dokunmuyor.")
+                continue
+            pos = self._adopt(sym, e.side, e.qty, e.entry_price)
+            self.store.save_account(self.account)
+            self.alert("Sahipsiz pozisyon devralındı",
+                       f"{fmt.pair(sym)} {'LONG' if e.side == LONG else 'SHORT'} {fmt.qty(e.qty)} @ {fmt.price(e.entry_price)}; "
+                       f"stop {fmt.price(pos.stop_price)}" + (f", hedef {fmt.price(pos.take_profit)}" if pos.take_profit else ""),
+                       "ADOPT")
+            try:
+                await self.futures.cancel_protection(sym)
+                await self._protect(pos)
+            except Exception as exc:
+                self.alert("Koruma emri yerleştirilemedi", f"{fmt.pair(sym)}: {exc}")
+        if startup:
+            for sym, pos in self.account.positions.items():
+                try:
+                    await self.futures.cancel_protection(sym)
+                    await self._protect(pos)
+                except Exception as exc:
+                    self.alert("Koruma emri yerleştirilemedi", f"{fmt.pair(sym)}: {exc}")
 
     # -- stream handlers -----------------------------------------------------
     async def on_stream(self, stream: str, data: dict) -> None:
@@ -175,7 +393,7 @@ class LiveEngine:
             return
         sym_l, kind = stream.split("@", 1)
         sym = sym_l.upper()
-        if sym not in self.books:
+        if sym not in self.books or sym not in self.symbols:
             return
         if kind.startswith("kline"):
             await self.on_kline(sym, data["k"])
@@ -184,26 +402,36 @@ class LiveEngine:
             await self.on_price(sym, float(data["p"]))
         elif kind.startswith("depth"):
             now = time.monotonic()
-            self.books[sym].update(data.get("bids", []), data.get("asks", []), data.get("lastUpdateId", 0), now)
+            # spot partial depth: bids/asks; futures depth stream: b/a
+            bids = data.get("bids", data.get("b", []))
+            asks = data.get("asks", data.get("a", []))
+            self.books[sym].update(bids, asks, data.get("lastUpdateId", data.get("u", 0)), now)
             self.spoof[sym].on_book(self.books[sym], now)
             self.last_seen[sym] = now
 
     async def on_ws_state(self, connected: bool) -> None:
+        self.ws_connected = connected
         if not connected and not self.protection:
             self.protection = True
             self.alert("Veri bağlantısı koptu",
                        "WebSocket bağlantısı kesildi. Koruma modu: yeni işlem açılmıyor, açık pozisyonların stopları "
-                       "REST fiyatıyla izleniyor. Otomatik yeniden bağlanılıyor.", "PROTECTION")
+                       "REST fiyatıyla izleniyor" + (" ve borsadaki stop emirleri yerinde" if self.live else "")
+                       + ". Otomatik yeniden bağlanılıyor.", "PROTECTION")
         elif connected:
-            for s in self.symbols:
+            for s in list(self.symbols):
                 await self._backfill(s)
+                last = self.bars.get(s)
+                if last is not None and len(last) and s in self.last_eval and last.index[-1] > self.last_eval[s]:
+                    # a bar closed while the stream was down: decide on it now instead of skipping it
+                    await self.on_bar_close(s, last.index[-1])
 
-    async def on_price(self, sym: str, price: float) -> None:
+    async def on_price(self, sym: str, price: float, from_stream: bool = True) -> None:
         now = time.monotonic()
         if not self.ticks[sym].accept(price):
             return
         self.last_price[sym] = price
-        self.last_seen[sym] = now
+        if from_stream:  # a REST fallback price must not make a dead stream look alive
+            self.last_seen[sym] = now
         self.spoof[sym].on_trade(price)
         self._flash_check(sym, price, now)
         pos = self.account.positions.get(sym)
@@ -217,7 +445,7 @@ class LiveEngine:
         if tp is not None and ((long and price >= tp) or (not long and price <= tp)):
             self._spawn(sym, self.close_position(sym, "Hedef kâr (take-profit) seviyesine ulaşıldı"))
             return
-        if update_trailing(pos, price, price, self.last_atr.get(sym, 0.0), self.cfg.risk):
+        if self.trailing and update_trailing(pos, price, price, self.last_atr.get(sym, 0.0), self.rcfg):
             self.dirty = True
 
     def _flash_check(self, sym: str, price: float, now: float) -> None:
@@ -277,13 +505,50 @@ class LiveEngine:
             log.info("%s eksik barlar REST ile tamamlandı (%s)", sym, rep)
 
     # -- decisions -------------------------------------------------------------
+    async def _live_layers(self, sym: str, bars: pd.DataFrame) -> dict:
+        """Single-bar HMM / GARCH layers from the online models (only the last row is filled)."""
+        layers: dict = {}
+        if sym in self.hmm:
+            m = self.hmm[sym]
+            m.bars_since_fit += 1
+            if m.needs_fit():
+                await asyncio.to_thread(m.fit, bars)
+            label, prob, state = m.infer_last(bars)
+            h = pd.DataFrame({"hmm_state": np.nan, "hmm_label": "UNKNOWN", "hmm_prob": np.nan}, index=bars.index)
+            h.iloc[-1] = [state, label, prob]
+            layers["hmm"] = h
+        if sym in self.garch:
+            g = self.garch[sym]
+            g.bars_since_fit += 1
+            if g.needs_fit():
+                await asyncio.to_thread(g.fit, bars)
+            vals = g.forecast_last(bars)
+            gdf = pd.DataFrame(np.nan, index=bars.index, columns=GARCH_COLS)
+            gdf.iloc[-1] = [vals.get(c, np.nan) for c in GARCH_COLS]
+            layers["garch"] = gdf
+        return layers
+
+    async def _await_partners(self, partners: set[str], ts: pd.Timestamp, timeout_s: float = 3.0) -> None:
+        """Pairs scores need the partner's bar for the same timestamp; Binance does not order klines
+        across symbols, so give the partners a moment to arrive (keeps live equal to the backtest)."""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if all(p in self.bars and len(self.bars[p]) and self.bars[p].index[-1] >= ts for p in partners):
+                return
+            await asyncio.sleep(0.1)
+
     async def on_bar_close(self, sym: str, ts: pd.Timestamp) -> None:
         cfg = self.cfg
-        partners = {b for a, b in cfg.pairs if a == sym} | {a for a, b in cfg.pairs if b == sym}
+        self.last_eval[sym] = ts
+        partners: set[str] = set()
+        if not is_squeeze(cfg):  # only the ensemble's pairs-trading signal reads partner prices
+            partners = ({b for a, b in cfg.pairs if a == sym} | {a for a, b in cfg.pairs if b == sym}) - {sym}
+            if partners:
+                await self._await_partners(partners, ts)
         data = {s: self.bars[s] for s in {sym} | partners if s in self.bars}
         bars = self.bars[sym]
         proba = None
-        if cfg.signals.ml.enabled:
+        if self.use_ml:
             model = self.ml[sym]
             model.bars_since_fit += 1
             if model.needs_fit():
@@ -291,12 +556,14 @@ class LiveEngine:
             p = model.predict_last(bars)
             proba = pd.Series(np.nan, index=bars.index)
             proba.iloc[-1] = p
+        layers = {s: {} for s in data}  # partners: no HMM/GARCH needed, only their prices for pairs
+        layers[sym] = await self._live_layers(sym, bars)
         now = time.monotonic()
         of_score, of_note = orderflow_signal(self.books[sym], self.flow[sym], self.spoof[sym], now, fmt.base_asset(sym))
         sent_score, sent_note = self.alt.sentiment(sym) if self.alt is not None else (None, "")
         frames = await asyncio.to_thread(
             prepare_universe, data, cfg, {sym: proba} if proba is not None else None,
-            {sym: {"orderflow": of_score, "sentiment": sent_score}})
+            {sym: {"orderflow": of_score, "sentiment": sent_score}}, layers)
         f = frames[sym]
         v = FrameView(f)
         i = len(f) - 1
@@ -306,77 +573,135 @@ class LiveEngine:
         pos = self.account.positions.get(sym)
         if pos is not None:
             pos.bars_held += 1
-            update_trailing(pos, float(v["high"][i]), float(v["low"][i]), self.last_atr[sym], cfg.risk)
+            if self.trailing:
+                update_trailing(pos, float(v["high"][i]), float(v["low"][i]), self.last_atr[sym], self.rcfg)
             self.dirty = True
         last_exit = self.account.last_exit.get(sym)
-        bse = int((ts - pd.Timestamp(last_exit)) / pd.Timedelta(milliseconds=cfg.bar_ms)) if last_exit else None
-        d = self.decider.evaluate(sym, v, i, pos, bse)
+        # bars since the exit, counted like the backtest (exit inside bar k -> 0 at k's close, 1 at k+1's)
+        bse = (max(0, math.ceil((ts - pd.Timestamp(last_exit)) / pd.Timedelta(milliseconds=cfg.bar_ms)))
+               if last_exit else None)
+        d = decide(self.decider, cfg, sym, v, i, pos, bse)
         log.info("%s bar %s | rejim %s/%s | skor %+.2f | %s", sym, ts, d.regime, d.vol_state, d.composite, d.action)
         if d.action == "EXIT":
             self._spawn(sym, self.close_position(sym, d.exit_reason))
         elif d.action in ("ENTER_LONG", "ENTER_SHORT"):
-            ok, why = self.risk.entry_allowed(self.account, sym, _now(), len(self.inflight - {sym}))
+            ok, why = self.risk.entry_allowed(self.account, sym, _now(), len(self.pending_entries - {sym}))
             if self.protection:
                 ok, why = False, "Koruma modu (veri akışı sorunlu)"
+            if sym in self.manage_only:
+                ok, why = False, "parite ayarlarda yok (yalnızca açık pozisyon takibi)"
             if ok:
                 notes = {"orderflow": of_note, "sentiment": sent_note}
-                self._spawn(sym, self.open_position(sym, d, f.iloc[i], notes))
+                self.pending_entries.add(sym)
+                self._spawn(sym, self._entry_task(sym, d, f.iloc[i], notes))
             else:
                 log.info("%s giriş sinyali reddedildi: %s", sym, why)
         await self.check_guards()
         self.store.save_account(self.account)
+
+    async def _entry_task(self, sym: str, d: Decision, row: pd.Series, notes: dict[str, str]) -> None:
+        try:
+            await self.open_position(sym, d, row, notes)
+        finally:
+            self.pending_entries.discard(sym)
 
     async def open_position(self, sym: str, d: Decision, row: pd.Series, notes: dict[str, str]) -> None:
         cfg = self.cfg
         async with self.entry_lock:
             if sym in self.account.positions or self.account.halted:
                 return
+            if self.live:
+                await self.refresh_balance()
             ref = self.broker.reference_price(sym)
             eq = self.equity()
             qv = self._quote_volume(sym)
             flt = self.filters.get(sym, {})
-            sz = size_position(cfg.risk, eq, self.account.cash, ref, d.atr, d.side, d.vol_state, self.account.trades,
+            # futures: notional is limited by margin x leverage; spot paper: by cash
+            budget = (self.available or 0.0) * cfg.live.leverage if self.live else self.account.cash
+            sz = size_position(self.rcfg, eq, budget, ref, d.atr, d.side, d.vol_state, self.account.trades,
                                step_size=flt.get("step_size"), min_notional=flt.get("min_notional"),
-                               round_trip_cost_pct=self.costs.round_trip_pct(ref, d.atr, 0.1 * eq, qv))
+                               round_trip_cost_pct=self.costs.round_trip_pct(ref, d.atr, 0.1 * eq, qv),
+                               size_mult=d.size_mult)
             if not sz.ok:
                 log.info("%s pozisyon açılmadı: %s", sym, sz.rejected)
                 return
-            fill = await self.broker.market_order(sym, d.side, sz.qty, ref, d.atr, qv)
-            if fill.notional + fill.fee > self.account.cash:
-                log.warning("%s: dolum sonrası nakit yetersiz, emir iptal", sym)
-                return
-            reasons = explain(row, d.side, cfg, notes)
-            pos = build_position(d, fill, sz, cfg.risk, reasons, _now().isoformat())
-            self.account.open_position(pos, fill)
+            if self.live:
+                try:
+                    fill = await self.futures.market_order(sym, d.side, sz.qty, ref)
+                except Exception as exc:
+                    unknown = type(exc).__name__ == "OrderStateUnknown"
+                    self.alert("Emir gönderilemedi" if not unknown else "Emir durumu belirsiz",
+                               f"{fmt.pair(sym)} {d.action}: {type(exc).__name__}: {exc}"
+                               + (". Bir sonraki borsa senkronunda pozisyon varsa devralınıp stop konacak."
+                                  if unknown else ""))
+                    return
+            else:
+                fill = await self.broker.market_order(sym, d.side, sz.qty, ref, d.atr, qv)
+                if fill.notional + fill.fee > self.account.cash:
+                    log.warning("%s: dolum sonrası nakit yetersiz, emir iptal", sym)
+                    return
+            reasons = explain_decision(cfg, row, d.side, notes)
+            pos = build_position(d, fill, sz, self.rcfg, reasons, _now().isoformat())
+            self.account.open_position(pos, fill, enforce_cash=not self.live)
             self.store.save_account(self.account)
             self.store.record_event(_now().isoformat(), "ENTRY", f"{sym} {d.action} {fill.qty}@{fill.price}")
+            if self.account.halted:
+                # The kill-switch fired while the order was travelling: undo it immediately.
+                await self.close_position(sym, "Kill-switch emir iletimi sırasında tetiklendi — pozisyon hemen kapatıldı")
+                return
+            if self.live:
+                try:
+                    await self._protect(pos)
+                except Exception as exc:
+                    self.alert("Koruma emri yerleştirilemedi",
+                               f"{fmt.pair(sym)} pozisyonu güvenlik için kapatılıyor: {type(exc).__name__}: {exc}")
+                    await self.close_position(sym, "Borsa tarafı stop emri yerleştirilemedi (güvenlik kapanışı)")
+                    return
+                try:
+                    await self.refresh_balance()
+                except Exception as exc:
+                    log.warning("Bakiye güncellenemedi: %s", exc)
             self.notifier.notify(msg.entry_message(
-                pos, fill, d, sz.notes, self.equity(), self.account.cash, self.account.starting_balance,
-                len(self.account.positions)))
+                pos, fill, d, sz.notes, self.equity(), self.cash(), self.account.starting_balance,
+                len(self.account.positions), mode=cfg.mode_label))
 
     async def close_position(self, sym: str, reason: str) -> None:
         pos = self.account.positions.get(sym)
         if pos is None:
             return
         ref = self.broker.reference_price(sym)
-        fill = await self.broker.market_order(sym, -pos.side, pos.qty, ref, self.last_atr.get(sym, 0.0),
-                                              self._quote_volume(sym))
-        if sym not in self.account.positions:
-            return
-        trade = self.account.close_position(sym, fill, reason, _now().isoformat())
-        self.store.record_trade(trade)
-        self.store.save_account(self.account)
-        self.notifier.notify(msg.exit_message(
-            trade, fill, self.equity(), self.account.cash, self.account.starting_balance,
-            len(self.account.positions), self.account.trades))
+        if self.live:
+            try:
+                fill = await self.futures.close_position(sym, pos.side, pos.qty, ref)
+            except Exception as exc:
+                self.alert("Pozisyon kapatılamadı",
+                           f"{fmt.pair(sym)}: {type(exc).__name__}: {exc}. Borsadaki stop emri pozisyonu korumaya devam ediyor.")
+                return
+            if fill is None:
+                fill = await self.futures.last_close_fill(sym, _ms(pos.entry_time), pos.side)
+                reason = f"{reason} (pozisyon borsada zaten kapanmıştı)"
+                if fill is None:
+                    fill = self._synthetic_fill(sym, -pos.side, pos.qty)
+            try:
+                await self.futures.cancel_protection(sym)
+            except Exception as exc:
+                log.warning("%s koruma emirleri iptal edilemedi: %s", sym, exc)
+            try:
+                await self.refresh_balance()
+            except Exception as exc:
+                log.warning("Bakiye güncellenemedi: %s", exc)
+        else:
+            fill = await self.broker.market_order(sym, -pos.side, pos.qty, ref, self.last_atr.get(sym, 0.0),
+                                                  self._quote_volume(sym))
+        await self._record_close(sym, fill, reason)
 
     async def check_guards(self) -> None:
         for ev, text in self.risk.update_guards(self.account, self.equity(), _now()):
             self.dirty = True
             if ev == "KILL_SWITCH":
                 self.alert("KILL-SWITCH — işlemler durduruldu",
-                           f"{text}. Tüm pozisyonlar kapatılıyor. Yeniden başlatmak için: python -m cappatrader resume",
-                           ev)
+                           f"{text}. Tüm pozisyonlar kapatılıyor. Yeniden başlatmak için botu durdurup: "
+                           "python -m cappatrader resume", ev)
                 for s in list(self.account.positions):
                     self._spawn(s, self.close_position(s, f"Kill-switch: {text}"))
             else:
@@ -393,13 +718,13 @@ class LiveEngine:
                 self.alert("Veri akışı gecikti",
                            f"{', '.join(fmt.pair(s) for s in stale)} için {self.cfg.data.stale_after_s:.0f} sn veri yok. "
                            "Koruma modu: yeni işlem yok, stoplar REST ile izleniyor.", "PROTECTION")
-            elif not stale and self.protection:
+            elif not stale and self.protection and self.ws_connected:
                 self.protection = False
                 self.alert("Veri akışı normale döndü", "Koruma modu kapatıldı, işlemler devam ediyor.", "PROTECTION")
             if self.protection:
-                for s in [s for s in stale if s in self.account.positions]:
+                for s in [s for s in self.symbols if s in self.account.positions]:
                     try:
-                        await self.on_price(s, await self.rest.ticker_price(s))
+                        await self.on_price(s, await self.rest.ticker_price(s), from_stream=False)
                     except Exception as exc:
                         log.warning("%s REST fiyatı alınamadı: %s", s, exc)
 
@@ -408,6 +733,13 @@ class LiveEngine:
         while True:
             await asyncio.sleep(10)
             t = time.time()
+            if self.live and t - self._last_sync >= cfg.live.sync_interval_s:
+                self._last_sync = t
+                try:
+                    await self.refresh_balance()
+                    await self.reconcile_positions()
+                except Exception as exc:
+                    log.warning("Borsa senkronizasyonu başarısız: %s", exc)
             await self.check_guards()
             if self.dirty:
                 self.store.save_account(self.account)
@@ -420,21 +752,38 @@ class LiveEngine:
                     log.warning("Alternatif veri güncellenemedi: %s", exc)
             if t - self._last_equity_rec >= cfg.bar_ms / 1000:
                 self._last_equity_rec = t
-                self.store.record_equity(_now().isoformat(), self.equity(), self.account.cash)
+                self.store.record_equity(_now().isoformat(), self.equity(), self.cash())
             if t - self._last_heartbeat >= 900:
                 self._last_heartbeat = t
                 log.info("Kalp atışı: bakiye %.2f USDT, nakit %.2f, açık %d, koruma=%s",
-                         self.equity(), self.account.cash, len(self.account.positions), self.protection)
+                         self.equity(), self.cash(), len(self.account.positions), self.protection)
             now = _now()
             today = now.strftime("%Y-%m-%d")
+            if self._summary_day is None:
+                self._summary_day = self.store.get_kv("summary_day")
             if now.hour == cfg.telegram.daily_summary_hour_utc and self._summary_day != today:
                 self._summary_day = today
+                self.store.set_kv("summary_day", today)
                 day_trades = [x for x in self.account.trades if x.exit_time.startswith(today)]
                 self.notifier.notify(msg.daily_summary(
-                    today, self.equity(), self.account.cash, self.account.starting_balance,
+                    today, self.equity(), self.cash(), self.account.starting_balance,
                     self.account.day_start_equity, self.account.positions, self.last_price, day_trades))
 
     # -- lifecycle ------------------------------------------------------------------
+    def _startup_text(self) -> str:
+        sq = self.cfg.strategy.squeeze
+        if is_squeeze(self.cfg):
+            strat = (f"Strateji: Squeeze Momentum + VWAP (stop {sq.atr_stop_mult:g}×ATR, hedef {sq.take_profit_r:g}R, "
+                     f"momentum dönüşünde erken çıkış)")
+        else:
+            strat = "Strateji: rejim ağırlıklı ensemble"
+        regime = ("HMM" if self.cfg.regime.method == "hmm" else "ADX") + " rejim · " + (
+            "GARCH volatilite" if self.cfg.regime.vol_method == "garch" else "ATR volatilite")
+        lines = [strat, regime]
+        if self.binance_balance_note:
+            lines.append(self.binance_balance_note)
+        return "\n".join(lines)
+
     async def run(self) -> None:
         self.stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -443,46 +792,85 @@ class LiveEngine:
                 loop.add_signal_handler(sig, self.stop_event.set)
             except (NotImplementedError, RuntimeError):
                 pass
+        self.lock.acquire()
         await self.notifier.start()
+        boot = asyncio.create_task(self.bootstrap(), name="bootstrap")
+        stop_wait = asyncio.create_task(self.stop_event.wait())
+        await asyncio.wait([boot, stop_wait], return_when=asyncio.FIRST_COMPLETED)
+        if not boot.done():  # Ctrl+C / SIGTERM while still loading history and fitting models
+            boot.cancel()
+            await asyncio.gather(boot, return_exceptions=True)
+            log.info("Başlatma sırasında durduruldu")
+            await self.shutdown(send_message=False)
+            return
+        stop_wait.cancel()
         try:
-            await self.bootstrap()
+            boot.result()
         except Exception as exc:
             self.notifier.notify(msg.alert_message("Başlatma hatası", f"{type(exc).__name__}: {exc}"))
             await self.shutdown(send_message=False)
             raise
         if self.cfg.telegram.send_startup:
             self.notifier.notify(msg.startup_message(
-                self.symbols, self.cfg.timeframe, self.equity(), self.account.cash, self.account.starting_balance,
-                self.account.positions, self.warnings))
+                self.symbols, self.cfg.timeframe, self.equity(), self.cash(), self.account.starting_balance,
+                self.account.positions, self.warnings, mode=self.cfg.mode_label, extra=self._startup_text()))
         for w in self.warnings:
             log.warning(w)
-        stream = BinanceStream(self.cfg.exchange.ws_base, market_streams(self.symbols, self.cfg.timeframe),
-                               self.on_stream, self.on_ws_state)
+        ws_base = self.cfg.exchange.futures_ws_base if self.market == "futures" else self.cfg.exchange.ws_base
+        stream = BinanceStream(ws_base, market_streams(self.symbols, self.cfg.timeframe), self.on_stream,
+                               self.on_ws_state)
         loops = [asyncio.create_task(stream.run(self.stop_event), name="ws"),
                  asyncio.create_task(self.watchdog(), name="watchdog"),
                  asyncio.create_task(self.periodic(), name="periodic")]
         stopper = asyncio.create_task(self.stop_event.wait())
         done, _ = await asyncio.wait([stopper, *loops], return_when=asyncio.FIRST_COMPLETED)
         for t in done:
-            if t is not stopper and t.exception() is not None:
+            if t is not stopper and not t.cancelled() and t.exception() is not None:
+                self.crashed = True
                 log.error("Arka plan görevi çöktü: %s", t.get_name(), exc_info=t.exception())
+                self.notifier.notify(msg.alert_message(
+                    "Bot beklenmedik şekilde durdu",
+                    f"'{t.get_name()}' görevi çöktü: {type(t.exception()).__name__}: {t.exception()}. "
+                    + ("Borsadaki stop emirleri açık pozisyonları korumaya devam ediyor. " if self.live else "")
+                    + "Botu yeniden başlatın."))
         self.stop_event.set()
+        stopper.cancel()
         for t in loops:
             t.cancel()
-        await asyncio.gather(*loops, return_exceptions=True)
+        await asyncio.gather(*loops, stopper, return_exceptions=True)
         await self.shutdown()
 
     async def shutdown(self, send_message: bool = True) -> None:
+        """Best effort: every step runs even if an earlier one fails."""
         if self.tasks:
-            await asyncio.wait(list(self.tasks), timeout=10)
-        self.store.save_account(self.account)
-        if send_message:
+            try:
+                await asyncio.wait(list(self.tasks), timeout=10)
+            except Exception as exc:
+                log.error("Açık emir görevleri beklenemedi: %s", exc)
+        try:
+            self.store.save_account(self.account)
+        except Exception as exc:
+            log.error("Hesap kaydedilemedi: %s", exc)
+        if send_message and not self.crashed:
             self.notifier.notify(msg.alert_message(
                 "CappaTrader durduruldu",
                 f"Bakiye {self.equity():,.2f} USDT, açık pozisyon {len(self.account.positions)} "
-                "(pozisyonlar kayıtlı; yeniden başlatınca stop takibi devam eder)."))
-        await self.notifier.stop()
-        await self.rest.close()
+                "(pozisyonlar kayıtlı; yeniden başlatınca takip devam eder"
+                + ("; borsadaki stop emirleri yerinde" if self.live else "") + ")."))
+        for name, closer in (("telegram", self.notifier.stop), ("rest", self.rest.close)):
+            try:
+                await closer()
+            except Exception as exc:
+                log.error("Kapatma adımı başarısız (%s): %s", name, exc)
+        if self.futures is not None:
+            try:
+                await self.futures.close()
+            except Exception as exc:
+                log.error("Futures bağlantısı kapatılamadı: %s", exc)
         if self._http is not None and not self._http.closed:
             await self._http.close()
-        self.store.close()
+        try:
+            self.store.close()
+        except Exception:
+            pass
+        self.lock.release()

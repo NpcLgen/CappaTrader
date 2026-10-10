@@ -17,13 +17,18 @@ def _ok(x) -> bool:
 
 
 def regime_line(row: pd.Series) -> str:
-    vol_pct = row.get("vol_pct")
-    vol = f"{vol_pct * 100:.0f}. persentil" if _ok(vol_pct) else "-"
-    return (
-        f"Rejim: {REGIME_TR.get(row['regime'], row['regime'])} · ADX {row['adx']:.1f} · "
-        f"volatilite {VOL_TR.get(row['vol_state'], row['vol_state'])} "
-        f"(ATR {row['atr_pct'] * 100:.2f}%, {vol})"
-    )
+    """Regime label with its source (HMM probability or ADX) and the volatility view (GARCH or ATR)."""
+    label = REGIME_TR.get(row["regime"], row["regime"])
+    prob = row.get("hmm_prob")
+    src = f"HMM olasılık %{prob * 100:.0f}" if _ok(prob) else f"ADX {row['adx']:.1f}"
+    ratio = row.get("garch_ratio")
+    if _ok(ratio):
+        vol = (f"GARCH tahmini vol %{row['garch_vol'] * 100:.2f} (uzun dönem %{row['garch_longrun'] * 100:.2f}, "
+               f"×{ratio:.2f})")
+    else:
+        vol_pct = row.get("vol_pct")
+        vol = f"ATR {row['atr_pct'] * 100:.2f}%" + (f", {vol_pct * 100:.0f}. persentil" if _ok(vol_pct) else "")
+    return f"Rejim: {label} · {src} · volatilite {VOL_TR.get(row['vol_state'], row['vol_state'])} ({vol})"
 
 
 def _component_text(name: str, row: pd.Series, cfg: Config) -> str | None:

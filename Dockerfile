@@ -9,7 +9,7 @@ RUN pip install --no-cache-dir .
 
 COPY config ./config
 
-RUN useradd --create-home trader && mkdir -p state logs data reports && chown -R trader /app
+RUN useradd --create-home --uid 1000 trader && mkdir -p state logs data reports && chown -R trader /app
 USER trader
 
 CMD ["python", "-m", "cappatrader", "paper"]

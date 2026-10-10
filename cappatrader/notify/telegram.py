@@ -75,7 +75,12 @@ class TelegramNotifier:
                     if resp.status == 200:
                         self.sent += 1
                         return True
-                    data = await resp.json(content_type=None)
+                    try:
+                        data = await resp.json(content_type=None)
+                    except ValueError:  # an HTML error page (e.g. a 502 from Telegram's front end)
+                        data = {"description": (await resp.text())[:200]}
+                    if not isinstance(data, dict):
+                        data = {"description": str(data)[:200]}
                     if resp.status == 429:
                         wait = float(data.get("parameters", {}).get("retry_after", 5))
                         await asyncio.sleep(wait)
@@ -106,6 +111,9 @@ class TelegramNotifier:
             text = await self.queue.get()
             try:
                 await self.send_now(text)
+            except Exception as exc:  # never let one bad send kill the worker
+                self.failed += 1
+                log.error("Telegram gönderimi beklenmedik hata: %s", self._mask(f"{type(exc).__name__}: {exc}"))
             finally:
                 self.queue.task_done()
             await asyncio.sleep(self.min_interval_s)

@@ -27,7 +27,8 @@ class Decision:
     reasons: list[str] = field(default_factory=list)
     components: dict[str, float] = field(default_factory=dict)
     exit_reason: str = ""
-    style: str = "TREND"  # TREND (momentum) or MR (mean reversion): drives the exit rule
+    style: str = "TREND"  # TREND (momentum), MR (mean reversion) or SQZ (squeeze-VWAP): drives the exit rule
+    size_mult: float = float("nan")  # GARCH volatility-forecast size multiplier (NaN = not used)
 
     @property
     def side(self) -> int:

@@ -112,7 +112,20 @@ def test_closed_kline_runs_full_decision_cycle(live_cfg, universe):
     eng, before = asyncio.run(scenario())
     assert eng.bars["BTCUSDT"].index[-1] == universe["BTCUSDT"].index[-1]
     assert len(eng.bars["BTCUSDT"]) >= before
-    assert eng.ml["BTCUSDT"].model is not None
+    assert eng.hmm["BTCUSDT"].fitted is not None and eng.garch["BTCUSDT"].params is not None
+    assert not eng.use_ml  # the ML direction model only votes in the ensemble strategy
+
+
+def test_ensemble_strategy_trains_ml_live(live_cfg, universe):
+    cfg = live_cfg.with_overrides({"strategy.name": "ensemble"})
+
+    async def scenario():
+        eng = _engine(cfg, universe)
+        await eng.bootstrap()
+        return eng
+
+    eng = asyncio.run(scenario())
+    assert eng.use_ml and eng.ml["BTCUSDT"].model is not None
 
 
 def test_kill_switch_closes_everything(live_cfg, universe):
@@ -165,3 +178,66 @@ def test_state_survives_restart(tmp_path, live_cfg, universe):
     asyncio.run(open_one())
     acct = StateStore(db).load_account(1000)
     assert "BTCUSDT" in acct.positions and acct.cash < 1000
+
+
+def test_protection_stays_on_while_ws_down_and_rest_prices_do_not_revive(live_cfg, universe):
+    async def scenario():
+        eng = _engine(live_cfg, universe)
+        await eng.bootstrap()
+        await eng.on_ws_state(True)
+        await eng.on_ws_state(False)  # stream dropped, data still "fresh"
+        assert eng.protection
+        before = dict(eng.last_seen)
+        await eng.on_price("BTCUSDT", eng.last_price["BTCUSDT"], from_stream=False)
+        assert eng.last_seen == before  # REST fallback prices never refresh liveness
+        task = asyncio.create_task(eng.watchdog())
+        await asyncio.sleep(5.3)  # one watchdog cycle
+        task.cancel()
+        return eng
+
+    eng = asyncio.run(scenario())
+    assert eng.protection  # not cleared while the WebSocket is still down
+    assert not any("normale döndü" in m for m in eng.notifier.messages)
+
+
+def test_stop_during_bootstrap_exits_cleanly(live_cfg, universe, tmp_path):
+    live_cfg.runtime.state_db = str(tmp_path / "s.sqlite")
+
+    class SlowREST(FakeREST):
+        async def recent_klines(self, symbol, tf, n):
+            await asyncio.sleep(30)
+            return await super().recent_klines(symbol, tf, n)
+
+    async def scenario():
+        eng = LiveEngine(live_cfg, rest=SlowREST(universe), notifier=CaptureNotifier(),
+                         store=StateStore(live_cfg.runtime.state_db))
+        task = asyncio.create_task(eng.run())
+        await asyncio.sleep(0.5)
+        eng.stop_event.set()
+        await asyncio.wait_for(task, timeout=5)
+        return eng
+
+    eng = asyncio.run(scenario())
+    assert not any("başlatıldı" in m for m in eng.notifier.messages)
+    assert not (tmp_path / "s.sqlite.lock").exists()
+
+
+def test_removed_symbol_with_open_position_is_still_managed(live_cfg, universe, tmp_path):
+    db = str(tmp_path / "s.sqlite")
+    store = StateStore(db)
+    acct = store.load_account(1000)
+    from cappatrader.models import Position
+
+    acct.positions["SOLUSDT"] = Position("SOLUSDT", 1, 1.0, 100.0, "2025-01-01T00:00:00+00:00", 90, 90, 10, 100,
+                                         "TREND_UP", 70, 0.1, 0.0)
+    store.save_account(acct)
+    store.close()
+
+    async def scenario():
+        eng = LiveEngine(live_cfg, rest=FakeREST(universe), notifier=CaptureNotifier(), store=StateStore(db))
+        await eng.bootstrap()
+        return eng
+
+    eng = asyncio.run(scenario())
+    assert "SOLUSDT" in eng.symbols and "SOLUSDT" in eng.manage_only and "SOLUSDT" in eng.bars
+    assert any("yalnızca stop/hedef takibi" in w for w in eng.warnings)

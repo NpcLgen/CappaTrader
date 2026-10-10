@@ -25,13 +25,27 @@ class SecretFilter(logging.Filter):
         return True
 
 
+class MaskingFormatter(logging.Formatter):
+    """Masks secrets in the fully formatted record, including exception tracebacks."""
+
+    def __init__(self, fmt: str, secrets: list[str]):
+        super().__init__(fmt)
+        self.secrets = [s for s in secrets if s and len(s) >= 8]
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        for s in self.secrets:
+            text = text.replace(s, "***")
+        return text
+
+
 def setup_logging(cfg: Config, verbose: bool = False) -> None:
     root = logging.getLogger()
     root.handlers.clear()
     root.setLevel(logging.DEBUG if verbose else logging.INFO)
-    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
-    secret_filter = SecretFilter([cfg.secrets.binance_api_key, cfg.secrets.binance_secret_key,
-                                  cfg.secrets.telegram_token])
+    secrets = [cfg.secrets.binance_api_key, cfg.secrets.binance_secret_key, cfg.secrets.telegram_token]
+    fmt = MaskingFormatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", secrets)
+    secret_filter = SecretFilter(secrets)
     console = logging.StreamHandler()
     console.setFormatter(fmt)
     console.addFilter(secret_filter)

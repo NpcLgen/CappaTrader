@@ -91,6 +91,7 @@ def size_position(
     step_size: float | None = None,
     min_notional: float | None = None,
     round_trip_cost_pct: float = 0.0,
+    size_mult: float | None = None,
 ) -> SizingResult:
     res = SizingResult()
     if not (price > 0 and atr > 0 and equity > 0):
@@ -99,7 +100,11 @@ def size_position(
     frac, kelly_note = risk_fraction(cfg, trades)
     res.notes.append(kelly_note)
     mult = 1.0
-    if vol_state == VOL_HIGH:
+    if size_mult is not None and math.isfinite(size_mult):
+        mult = min(max(size_mult, 0.0), 1.0)
+        if mult < 1.0:
+            res.notes.append(f"GARCH volatilite tahmini uzun dönem ortalamasının üstünde → boyut ×{mult:.2f}")
+    if vol_state == VOL_HIGH and cfg.high_vol_size_mult < mult:
         mult = cfg.high_vol_size_mult
         res.notes.append(f"Yüksek volatilite rejimi → boyut ×{mult:g}")
     res.risk_fraction = frac * mult

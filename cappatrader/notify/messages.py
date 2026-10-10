@@ -35,7 +35,7 @@ def entry_message(pos: Position, fill: Fill, d: Decision, sizing_notes: list[str
     head = "🟢 <b>ALIŞ (LONG)" if long else "🟠 <b>AÇIĞA SATIŞ (SHORT)"
     asset = fmt.base_asset(pos.symbol)
     stop_pct = (pos.stop_price / pos.entry_price - 1)
-    style = "Ortalamaya dönüş" if pos.style == "MR" else "Trend takibi / momentum"
+    style = {"MR": "Ortalamaya dönüş", "SQZ": "Squeeze momentum + VWAP"}.get(pos.style, "Trend takibi / momentum")
     risk_amt = pos.risk_per_unit * pos.qty
     lines = [
         f"{head} — {escape(fmt.pair(pos.symbol))}</b> · {mode}",
@@ -69,6 +69,7 @@ def exit_message(t: Trade, fill: Fill, equity: float, cash: float, start_balance
         f"{head} — {escape(fmt.pair(t.symbol))}</b> · {mode}",
         f"Giriş <code>{fmt.price(t.entry_price)}</code> → Çıkış <code>{fmt.price(t.exit_price)}</code> "
         f"(slippage {fill.slippage_bps:.1f} bps) · süre {_duration(t.entry_time, t.exit_time)}",
+        f"Miktar: {fmt.qty(t.qty)} {escape(fmt.base_asset(t.symbol))} ≈ {fmt.usd(t.qty * t.exit_price)}",
         f"{'✅' if win else '❌'} <b>P&amp;L: {fmt.usd(t.pnl, signed=True)} ({fmt.pct(t.return_pct, signed=True)} · "
         f"{t.r_multiple:+.2f}R)</b> · komisyon {t.fees:.2f} USDT dahil",
         "",
@@ -86,12 +87,16 @@ def exit_message(t: Trade, fill: Fill, equity: float, cash: float, start_balance
 
 
 def startup_message(symbols: list[str], timeframe: str, equity: float, cash: float, start_balance: float,
-                    positions: dict[str, Position], warnings: list[str]) -> str:
+                    positions: dict[str, Position], warnings: list[str], mode: str = "KAĞIT HESAP",
+                    extra: str = "") -> str:
+    note = " (gerçek emir yok)" if mode == "KAĞIT HESAP" else ""
     lines = [
-        "🤖 <b>CappaTrader başlatıldı</b> · KAĞIT HESAP (gerçek emir yok)",
+        f"🤖 <b>CappaTrader başlatıldı</b> · {escape(mode)}{note}",
         f"Pariteler: {escape(', '.join(fmt.pair(s) for s in symbols))} · zaman dilimi {escape(timeframe)}",
-        balance_block(equity, cash, start_balance, len(positions)),
     ]
+    if extra:
+        lines.append(escape(extra))
+    lines.append(balance_block(equity, cash, start_balance, len(positions)))
     for p in positions.values():
         lines.append(f"• Açık: {escape(fmt.pair(p.symbol))} {fmt.qty(p.qty)} @ {fmt.price(p.entry_price)}, "
                      f"stop {fmt.price(p.stop_price)}")

@@ -1,4 +1,3 @@
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -101,7 +100,8 @@ def test_execution_delay_changes_fills(cfg, universe):
 
 
 def test_extra_slippage_hurts(cfg, universe):
-    base = cfg.with_overrides({"signals.ml.enabled": False, "risk.max_drawdown": 0.99})
+    # max_cost_r 0: the cost-aware stop floor would otherwise change which trades are taken
+    base = cfg.with_overrides({"signals.ml.enabled": False, "risk.max_drawdown": 0.99, "risk.max_cost_r": 0.0})
     frames = prepare_universe(universe, base)
     a = Backtester(base).run(frames, collect_reasons=False).metrics
     b = Backtester(base.with_overrides({"costs.extra_slippage_bps": 50})).run(frames, collect_reasons=False).metrics
@@ -137,3 +137,46 @@ def test_walk_forward_windows_do_not_overlap(cfg, universe):
     assert res.oos_equity.index.is_monotonic_increasing
     assert all(pd.Timestamp(t.entry_time) >= res.windows[0].oos_start for t in res.oos_trades)
     assert "Walk-Forward" in res.summary()
+
+
+def test_walk_forward_oos_is_one_continuous_account(cfg, universe):
+    c = cfg.with_overrides({"account.allow_short": True, "risk.max_drawdown": 0.99, "risk.daily_loss_limit": 1.0})
+    c.walkforward.is_bars, c.walkforward.oos_bars = 1000, 500
+    c.walkforward.grid = {"strategy.squeeze.atr_stop_mult": [1.5, 2.0]}
+    res = walk_forward(c, universe)
+    eq = res.oos_equity
+    # trade P&L reconciles with the reported OOS balance change
+    assert sum(t.pnl for t in res.oos_trades) == pytest.approx(eq.iloc[-1] - c.account.starting_balance, rel=1e-9)
+    assert res.oos_metrics["net_pnl"] == pytest.approx(res.oos_metrics["end_equity"] - c.account.starting_balance)
+
+
+def test_walk_forward_kill_switch_carries_over(cfg, universe):
+    c = cfg.with_overrides({"account.allow_short": True, "risk.max_drawdown": 0.01})
+    c.walkforward.is_bars, c.walkforward.oos_bars = 1000, 500
+    c.walkforward.grid = {"strategy.squeeze.atr_stop_mult": [1.5]}
+    res = walk_forward(c, universe)
+    halted_in = next(i for i, w in enumerate(res.windows) if w.oos_metrics.get("trades", 0) > 0)
+    assert all(w.oos_metrics.get("trades", 0) == 0 for w in res.windows[halted_in + 1:])
+    assert any("kill-switch" in r for r in res.verdict_reasons)
+
+
+def test_reports_are_strict_json(tmp_path):
+    import json
+
+    from cappatrader.cli import _save
+
+    _save(tmp_path, "x", {"a": float("inf"), "b": [float("nan"), 1.5], "c": {"d": float("-inf")}})
+    data = json.loads((tmp_path / "metrics.json").read_text(), parse_constant=lambda c: pytest.fail(c))
+    assert data == {"a": None, "b": [None, 1.5], "c": {"d": None}}
+
+
+def test_stress_breakeven_uses_realistic_baseline(cfg, universe):
+    c = cfg.with_overrides({"signals.ml.enabled": False})
+    c.stress.extra_slippage_bps = [20, 30]  # no 0 entry in the user's grid
+    c.stress.latency_ms = [0]
+    c.stress.delay_bars = [0]
+    res = stress_test(c, universe)
+    if res.realistic.total_return > 0:
+        assert res.breakeven_extra_bps > 0
+    else:
+        assert res.breakeven_extra_bps == 0.0

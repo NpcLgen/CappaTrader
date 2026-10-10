@@ -3,8 +3,9 @@
     |---- IS (optimise grid) ----|-- OOS (trade best params) --|
                      |---- IS ----|-- OOS --|   (rolled forward by OOS length)
 
-The stitched OOS equity is the honest estimate of live performance. If it is not
-profitable, the in-sample optimum was curve fitting.
+The OOS windows are traded as ONE continuous account (balance, open-trade history and
+a fired kill-switch carry over), so the OOS equity is the honest estimate of live
+performance. If it is not profitable, the in-sample optimum was curve fitting.
 """
 
 from __future__ import annotations
@@ -21,11 +22,11 @@ from cappatrader.backtest.engine import Backtester, benchmark_curve
 from cappatrader.backtest.metrics import compute_metrics, format_metrics
 from cappatrader.config import Config
 from cappatrader.models import Trade
-from cappatrader.strategy.pipeline import prepare_universe
+from cappatrader.strategy.pipeline import Layers, prepare_universe
 
 # Params that change the prepared frame; everything else (risk, ensemble
 # thresholds, costs) only changes how the backtester acts on it.
-_FRAME_PREFIXES = ("signals.", "regime.", "ensemble.weights", "pairs")
+_FRAME_PREFIXES = ("signals.", "regime.", "ensemble.weights", "pairs", "strategy.squeeze.")
 
 
 @dataclass
@@ -83,23 +84,12 @@ def _objective(m: dict, name: str, min_trades: int) -> float:
     return m.get("sharpe", -math.inf)
 
 
-def _stitch(curves: list[pd.Series], start_balance: float) -> pd.Series:
-    out, level = [], start_balance
-    for c in curves:
-        c = c.dropna()
-        if c.empty:
-            continue
-        scaled = c / c.iloc[0] * level
-        out.append(scaled)
-        level = float(scaled.iloc[-1])
-    return pd.concat(out) if out else pd.Series(dtype=float)
-
-
 def walk_forward(
     cfg: Config,
     data: dict[str, pd.DataFrame],
     ml_probas: dict[str, pd.Series] | None = None,
     progress: Callable[[str], None] | None = None,
+    layers: dict[str, Layers] | None = None,
 ) -> WalkForwardResult:
     wf = cfg.walkforward
     master = None
@@ -119,11 +109,14 @@ def walk_forward(
             continue  # e.g. ema_fast >= ema_slow
         key = _frame_key(combo)
         if key not in frame_cache:
-            frame_cache[key] = prepare_universe(data, c, ml_probas)
+            # A grid over regime.* changes the HMM/GARCH layers themselves: recompute them.
+            reuse = layers if not any(k.startswith("regime.") for k in combo) else None
+            frame_cache[key] = prepare_universe(data, c, ml_probas, layers=reuse)
         cfgs.append((combo, c, frame_cache[key]))
 
     windows: list[WindowResult] = []
-    oos_curves, oos_trades = [], []
+    oos_curves, oos_trades, oos_events = [], [], []
+    acct = None
     start = 0
     while start + wf.is_bars + wf.oos_bars <= n:
         is_s, is_e = master[start], master[start + wf.is_bars]
@@ -140,7 +133,9 @@ def walk_forward(
             combo, c, frames = cfgs[0]
             best = (combo, c, frames, {})
         combo, c, frames, is_m = best
-        oos = Backtester(c).run(frames, oos_s, oos_e)
+        oos = Backtester(c).run(frames, oos_s, oos_e, account=acct)
+        acct = oos.account
+        oos_events.extend(oos.events)
         windows.append(WindowResult(len(windows), is_s, is_e, oos_s, oos_e, combo, is_m, oos.metrics))
         oos_curves.append(oos.equity)
         oos_trades.extend(oos.trades)
@@ -148,7 +143,8 @@ def walk_forward(
             progress(f"Pencere {len(windows)}: OOS getiri {oos.metrics.get('total_return', 0) * 100:+.2f}% ({_fmt_params(combo)})")
         start += wf.oos_bars
 
-    equity = _stitch(oos_curves, cfg.account.starting_balance)
+    curves = [c.dropna() for c in oos_curves if len(c.dropna())]
+    equity = pd.concat(curves) if curves else pd.Series(dtype=float)
     first_frames = cfgs[0][2]
     bench = benchmark_curve(first_frames, equity.index, cfg.account.starting_balance) if len(equity) else None
     oos_m = compute_metrics(equity, oos_trades, cfg.bars_per_year, bench)
@@ -177,4 +173,9 @@ def walk_forward(
     if oos_m.get("sharpe", 0.0) < 0.5:
         ok = False
         reasons.append(f"OOS Sharpe {oos_m.get('sharpe', 0):.2f} < 0.5")
+    for ts, ev, text in oos_events:
+        if ev == "KILL_SWITCH":
+            reasons.append(f"OOS'ta {ts:%Y-%m-%d} tarihinde kill-switch tetiklendi, sonrasında işlem yok "
+                           "(canlı hesapta da böyle olurdu)")
+            break
     return WalkForwardResult(windows, equity, oos_trades, oos_m, wfe, ok, reasons)

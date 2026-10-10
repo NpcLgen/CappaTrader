@@ -31,3 +31,7 @@ include = ["cappatrader*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+    # hmmlearn 0.3.3 sets ndarray.shape (deprecated in numpy 2.5); harmless
+    "ignore:Setting the shape on a NumPy array:DeprecationWarning",
+]

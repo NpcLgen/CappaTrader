@@ -43,11 +43,13 @@ class Account:
         return sum(t.fees for t in self.trades) + sum(p.entry_fee for p in self.positions.values())
 
     # -- ledger ----------------------------------------------------------
-    def open_position(self, pos: Position, fill: Fill) -> None:
+    def open_position(self, pos: Position, fill: Fill, enforce_cash: bool = True) -> None:
+        """enforce_cash=False is for live futures, where margin (not full notional) is locked
+        on the exchange and cash/equity are refreshed from Binance instead."""
         if pos.symbol in self.positions:
             raise ValueError(f"{pos.symbol} için zaten açık pozisyon var")
         cost = fill.qty * fill.price + fill.fee
-        if cost > self.cash + 1e-9:
+        if enforce_cash and cost > self.cash + 1e-9:
             raise ValueError(f"Yetersiz bakiye: gereken {cost:.2f}, mevcut {self.cash:.2f}")
         self.cash -= cost
         self.positions[pos.symbol] = pos

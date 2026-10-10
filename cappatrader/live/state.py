@@ -37,6 +37,17 @@ class StateStore:
     def close(self) -> None:
         self.conn.close()
 
+    def get_kv(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def set_kv(self, key: str, value) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO kv(key, value) VALUES(?, ?)", (key, json.dumps(value)))
+        self.conn.commit()
+
+    def has_account(self) -> bool:
+        return self.conn.execute("SELECT 1 FROM kv WHERE key='account'").fetchone() is not None
+
     def load_account(self, starting_balance: float) -> Account:
         row = self.conn.execute("SELECT value FROM kv WHERE key='account'").fetchone()
         if row is None:

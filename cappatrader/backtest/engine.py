@@ -26,9 +26,9 @@ from cappatrader.models import Decision, Trade
 from cappatrader.risk.manager import RiskManager
 from cappatrader.risk.sizing import size_position
 from cappatrader.risk.stops import stop_hit, stop_reason, take_profit_hit, update_trailing
-from cappatrader.strategy.decision import DecisionEngine, FrameView
-from cappatrader.strategy.explain import explain
-from cappatrader.strategy.pipeline import prepare_universe
+from cappatrader.strategy.decision import FrameView
+from cappatrader.strategy.factory import decide, explain_decision, make_decider, strategy_risk, uses_trailing
+from cappatrader.strategy.pipeline import Layers, prepare_universe
 
 
 @dataclass
@@ -38,6 +38,7 @@ class BacktestResult:
     trades: list[Trade]
     metrics: dict
     events: list[tuple] = field(default_factory=list)
+    account: Account | None = None
 
     def summary(self, title: str = "Backtest") -> str:
         return format_metrics(self.metrics, title)
@@ -59,8 +60,10 @@ class Backtester:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.costs = CostModel(cfg.costs, cfg.bar_ms)
-        self.risk = RiskManager(cfg.risk)
-        self.decider = DecisionEngine(cfg)
+        self.rcfg = strategy_risk(cfg)
+        self.risk = RiskManager(self.rcfg)
+        self.decider = make_decider(cfg)
+        self.trailing = uses_trailing(cfg)
 
     # -- order helpers -----------------------------------------------------
     @staticmethod
@@ -75,18 +78,18 @@ class Backtester:
         eq = acct.equity({**last, s: ref})
         qv = self._prev(v, "quote_volume", i)
         rt_cost = self.costs.round_trip_pct(ref, d.atr, 0.1 * eq, qv)
-        sz = size_position(self.cfg.risk, eq, acct.cash, ref, d.atr, d.side, d.vol_state, acct.trades,
-                           round_trip_cost_pct=rt_cost)
+        sz = size_position(self.rcfg, eq, acct.cash, ref, d.atr, d.side, d.vol_state, acct.trades,
+                           round_trip_cost_pct=rt_cost, size_mult=d.size_mult)
         if not sz.ok:
             return
         fill = self.costs.fill(s, d.side, sz.qty, ref, d.atr, qv, ts)
         cost = fill.notional + fill.fee
         if cost > acct.cash:
             qty = sz.qty * acct.cash / cost * 0.999
-            if qty * ref < self.cfg.risk.min_notional:
+            if qty * ref < self.rcfg.min_notional:
                 return
             fill = self.costs.fill(s, d.side, qty, ref, d.atr, qv, ts)
-        acct.open_position(build_position(d, fill, sz, self.cfg.risk, reasons, str(ts)), fill)
+        acct.open_position(build_position(d, fill, sz, self.rcfg, reasons, str(ts)), fill)
 
     def _close(self, acct: Account, s: str, ref: float, v: FrameView, i: int, ts, reason: str) -> None:
         pos = acct.positions[s]
@@ -95,7 +98,10 @@ class Backtester:
         acct.close_position(s, fill, reason, str(ts))
 
     # -- main loop -----------------------------------------------------------
-    def run(self, frames: dict[str, pd.DataFrame], start=None, end=None, collect_reasons: bool = True) -> BacktestResult:
+    def run(self, frames: dict[str, pd.DataFrame], start=None, end=None, collect_reasons: bool = True,
+            account: Account | None = None) -> BacktestResult:
+        """account: continue an existing account (walk-forward chains its OOS windows this way, so
+        balance, kill-switch state and Kelly history carry over exactly as in one live account)."""
         cfg = self.cfg
         symbols = list(frames)
         views = {s: FrameView(f) for s, f in frames.items()}
@@ -108,7 +114,9 @@ class Backtester:
             master = master[master < pd.Timestamp(end)]
         lookup = {s: dict(zip(f.index, range(len(f)))) for s, f in frames.items()}
 
-        acct = Account(cfg.account.starting_balance)
+        acct = account if account is not None else Account(cfg.account.starting_balance)
+        start_balance = acct.equity({})
+        first_trade = len(acct.trades)
         pending: dict[str, dict] = {}
         last: dict[str, float] = {}
         last_exit_k: dict[str, int] = {}
@@ -144,8 +152,8 @@ class Backtester:
                         if tp is not None:
                             self._close(acct, s, tp, v, i, ts, "Hedef kâr (take-profit) seviyesine ulaşıldı")
                             last_exit_k[s] = k
-                        else:
-                            update_trailing(pos, h, l, v["atr"][i], cfg.risk)
+                        elif self.trailing:
+                            update_trailing(pos, h, l, v["atr"][i], self.rcfg)
                 last[s] = c
 
             # 2. portfolio guards at the close
@@ -166,13 +174,13 @@ class Backtester:
                 if pos is not None:
                     pos.bars_held += 1
                 bse = k - last_exit_k[s] if s in last_exit_k else None
-                d = self.decider.evaluate(s, views[s], i, pos, bse)
+                d = decide(self.decider, cfg, s, views[s], i, pos, bse)
                 if d.action == "EXIT":
                     pending[s] = {"kind": "exit", "exec_k": k + 1 + delay, "reason": d.exit_reason}
                 elif d.action in ("ENTER_LONG", "ENTER_SHORT"):
                     ok, _ = self.risk.entry_allowed(acct, s, ts, n_pending_entries)
                     if ok:
-                        reasons = explain(views[s].row(i), d.side, cfg) if collect_reasons else []
+                        reasons = explain_decision(cfg, views[s].row(i), d.side) if collect_reasons else []
                         pending[s] = {"kind": "enter", "exec_k": k + 1 + delay, "decision": d, "reasons": reasons}
                         n_pending_entries += 1
             eq_vals[k] = eq
@@ -187,13 +195,14 @@ class Backtester:
             eq_vals[-1] = acct.equity(last)
 
         equity = pd.Series(eq_vals, index=master, name="equity")
-        bench = benchmark_curve(frames, master, cfg.account.starting_balance)
-        metrics = compute_metrics(equity, acct.trades, cfg.bars_per_year, bench,
+        bench = benchmark_curve(frames, master, start_balance)
+        trades = acct.trades[first_trade:]
+        metrics = compute_metrics(equity, trades, cfg.bars_per_year, bench,
                                   exposure=float(exposed.mean()) if len(exposed) else 0.0)
-        return BacktestResult(equity, bench, acct.trades, metrics, events)
+        return BacktestResult(equity, bench, trades, metrics, events, acct)
 
 
 def run_backtest(cfg: Config, data: dict[str, pd.DataFrame], ml_probas: dict[str, pd.Series] | None = None,
-                 start=None, end=None) -> BacktestResult:
-    frames = prepare_universe(data, cfg, ml_probas)
+                 start=None, end=None, layers: dict[str, Layers] | None = None) -> BacktestResult:
+    frames = prepare_universe(data, cfg, ml_probas, layers=layers)
     return Backtester(cfg).run(frames, start, end)

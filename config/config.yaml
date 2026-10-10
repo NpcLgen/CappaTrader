@@ -1,62 +1,114 @@
 # CappaTrader yapılandırması. Burada olmayan her ayar cappatrader/config.py içindeki
 # varsayılanı kullanır. Gizli anahtarlar (Binance, Telegram) burada DEĞİL, .env dosyasında.
 
-mode: paper                 # bu sürümde yalnızca kağıt hesap (gerçek emir gönderilmez)
+# paper: canlı piyasa verisiyle sanal hesap (gerçek emir yok)
+# live : Binance USD-M futures'ta GERÇEK emir. Önce live.env: demo ile deneyin.
+mode: paper
 timeframe: 1h               # karar barı; 15m daha çok işlem ama maliyet/R oranı kötüleşir
 
-# Kripto pariteler + kripto altın (PAXG = 1 ons fiziki altına dayalı token)
+# Kripto pariteler + kripto altın (PAXG = 1 ons fiziki altına dayalı token).
+# Futures'ta bulunmayan bir parite canlı modda otomatik devre dışı kalır (uyarı verilir).
 symbols: [BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, XRPUSDT, PAXGUSDT]
 
-# İstatistiksel arbitraj (pairs trading) çiftleri: [A, B]
+# İstatistiksel arbitraj (pairs trading) çiftleri: [A, B] — yalnızca ensemble stratejisinde kullanılır
 pairs:
   - [ETHUSDT, BTCUSDT]
   - [SOLUSDT, ETHUSDT]
 
 account:
-  starting_balance: 1000    # sanal USDT bakiyesi
-  allow_short: false        # spot = yalnızca long. true: 1x perpetual simülasyonu (short açılabilir)
+  starting_balance: 1000    # sanal USDT bakiyesi (balance_source: virtual iken)
+  allow_short: true         # Squeeze/VWAP stratejisi short da açar (kağıt hesapta 1x perpetual simülasyonu)
+  balance_source: virtual   # virtual | binance (yeni kağıt hesabı gerçek Binance bakiyesiyle başlat, salt okuma)
+  binance_wallet: futures   # futures (USD-M) | spot
 
 exchange:
   rest_base: https://api.binance.com
   ws_base: wss://stream.binance.com:9443
-  # Binance.com erişiminin kısıtlı olduğu bölgelerde salt piyasa verisi için:
+  futures_rest_base: https://fapi.binance.com
+  futures_ws_base: wss://fstream.binance.com
+  market_data: spot         # kağıt hesap için spot | futures (live modda her zaman futures)
+  # Binance.com erişiminin kısıtlı olduğu bölgelerde spot piyasa verisi için:
   # rest_base: https://data-api.binance.vision
   # ws_base: wss://data-stream.binance.vision:9443
 
-regime:
-  adx_trend: 25             # ADX > 25 → trend rejimi (momentum/breakout)
-  adx_range: 20             # ADX < 20 → yatay rejim (RSI/Bollinger ortalamaya dönüş)
-  high_vol_pct: 0.90        # ATR% kendi geçmişinin %90 üstü → pozisyon ×0.5
-  extreme_vol_pct: 0.98     # %98 üstü → yeni işlem yok
+# ── Strateji ─────────────────────────────────────────────────────────────────────
+strategy:
+  name: squeeze_vwap        # squeeze_vwap (Pine Script portu) | ensemble (eski çok sinyalli sistem)
+  squeeze:
+    length: 60              # Pine: Hesaplama Uzunluğu
+    bb_mult: 2.0            # Pine: BB Çarpan
+    kc_mult: 1.5            # Pine: KC Çarpan
+    calc_mode: fixed        # fixed (Sabit) | dynamic (Dinamik) | percent (Yüzdesel)
+    fixed_val: 0.0
+    dyn_mult: 2.5
+    perc_val: 75.0
+    vwap_anchor: D          # D: her gün 00:00 UTC sıfırlanır | W: haftalık | rolling: son N bar
+    vwap_rolling_bars: 24
+    long_trigger: state     # LONG: fiyat VWAP üstünde + momentum yükseliyor (state) / yeni yukarı döndü (turn)
+    short_trigger: turn     # SHORT: fiyat VWAP altında + momentum alıcıdan satıcıya döndü (turn) / düşüyor (state)
+    confirm_bars: 1         # yönün kaç bar korunması gerekir (Pine "ardışık 3" = 3)
+    atr_stop_mult: 1.5      # stop = giriş ∓ 1.5 × ATR (giriş anındaki ATR)
+    take_profit_r: 1.1      # hedef = riskin 1.1 katı; hedefe varmadan momentum dönerse erken çıkış
+    tradeable_regimes: [TREND_UP, TREND_DOWN, RANGE]   # HMM bu rejimlerden birindeyse işlem açılır
 
-signals:
+# ── Rejim ve volatilite ─────────────────────────────────────────────────────────────
+regime:
+  method: hmm               # hmm (veriden öğrenen Hidden Markov Model) | adx (klasik)
+  vol_method: garch         # garch (gelecek bar volatilite tahmini) | atr (ATR persentili)
+  hmm:
+    n_states: 3             # öğrenilecek piyasa durumu sayısı
+    feature_window: 12      # getiri ve volatilite özellikleri için pencere (bar)
+    train_bars: 2000        # model son kaç barla eğitilir
+    retrain_every: 250      # kaç barda bir yeniden eğitilir
+  garch:
+    train_bars: 1500
+    retrain_every: 250
+    high_ratio: 1.5         # tahmini vol / uzun dönem vol ≥ 1.5 → yüksek (boyut küçülür)
+    extreme_ratio: 2.5      # ≥ 2.5 → aşırı (yeni işlem açılmaz, ani şok koruması)
+    min_size_mult: 0.25     # boyut çarpanı = 1/oran, en az 0.25
+
+signals:                    # ensemble stratejisi ayarları
   ema_fast: 20
   ema_slow: 50
   breakout_period: 55
   ml:
     enabled: true
-    prob_threshold: 0.65    # ML olasılığı %65'i aşmazsa oy vermez
-    horizon: 4              # kaç bar sonrasının yönü tahmin ediliyor
+    prob_threshold: 0.65    # ML olasılığı ≥ %65 (yükseliş) veya ≤ %35 (düşüş) olmazsa oy vermez
+    horizon: 4
 
 ensemble:
-  entry_confidence: 65      # 0-100 güven skoru eşiği (PRD örneği %75)
+  entry_confidence: 65
 
+# ── Risk ────────────────────────────────────────────────────────────────────────────
 risk:
   base_risk_per_trade: 0.01 # Kelly için yeterli geçmiş oluşana kadar işlem başı %1 risk
   max_risk_per_trade: 0.02
   kelly_fraction: 0.5       # yarım Kelly
-  atr_stop_mult: 2.0
-  trail_atr_mult: 3.0
-  trail_activate_r: 1.0     # 1R kâra geçince izleyen stop (en az başabaş) devreye girer
   max_open_positions: 4
   max_position_pct: 0.30
   max_drawdown: 0.15        # PRD: %15 düşüşte kill-switch
   daily_loss_limit: 0.04
+  # ensemble stratejisine özel (squeeze_vwap kendi stop/hedef kuralını kullanır):
+  atr_stop_mult: 2.0
+  trail_atr_mult: 3.0
+  trail_activate_r: 1.0
 
 costs:
-  taker_fee: 0.001          # Binance spot %0.1 (BNB ile %0.075)
+  taker_fee: 0.001          # Binance spot %0.1; USD-M futures taker ~%0.05 (canlıda gerçek dolum kullanılır)
   base_slippage_bps: 2
   latency_ms: 250
+
+# ── Canlı işlem (mode: live) ───────────────────────────────────────────────────────
+live:
+  env: demo                 # demo: Binance demo trading (sanal para, demo.binance.com anahtarı)
+                            # mainnet: GERÇEK PARA
+  # mainnet için aşağıdaki satırı tam olarak şöyle yazmanız gerekir:
+  # mainnet_confirm: "GERCEK PARA ILE ISLEM YAPMAYI ONAYLIYORUM"
+  mainnet_confirm: ""
+  leverage: 2               # risk, kaldıraçtan bağımsız olarak stop mesafesi ve kasa yüzdesiyle sınırlıdır
+  margin_mode: isolated     # isolated | cross
+  place_exchange_stops: true  # stop ve hedef emirleri borsaya da girilir (bot kapansa da pozisyon korunur)
+  sync_interval_s: 30       # borsa ile pozisyon/bakiye senkron aralığı
 
 telegram:
   enabled: true

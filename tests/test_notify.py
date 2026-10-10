@@ -75,3 +75,34 @@ def test_disabled_notifier_does_not_send():
     tg = TelegramNotifier("", "", enabled=True)
     assert not tg.enabled
     assert asyncio.run(tg.send_now("x")) is False
+
+
+def test_html_error_page_does_not_kill_notifier():
+    """Telegram's front end can answer 502 with an HTML page; the worker must survive and retry."""
+
+    async def scenario():
+        calls = {"n": 0}
+        received = []
+
+        async def handler(request: web.Request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return web.Response(status=502, text="<html><body>Bad Gateway</body></html>", content_type="text/html")
+            received.append(await request.json())
+            return web.json_response({"ok": True})
+
+        app = web.Application()
+        app.router.add_post("/bot{token}/sendMessage", handler)
+        server = TestServer(app)
+        await server.start_server()
+        tg = TelegramNotifier("123:ABC", "42", api_base=str(server.make_url("")).rstrip("/"), min_interval_s=0)
+        await tg.start()
+        tg.notify("birinci")
+        tg.notify("ikinci")
+        await tg.stop(flush_timeout=20)
+        await server.close()
+        return received, tg
+
+    received, tg = asyncio.run(scenario())
+    assert [r["text"] for r in received] == ["birinci", "ikinci"]
+    assert tg.sent == 2

@@ -13,7 +13,7 @@ import pandas as pd
 
 from cappatrader.backtest.engine import Backtester
 from cappatrader.config import Config
-from cappatrader.strategy.pipeline import prepare_universe
+from cappatrader.strategy.pipeline import Layers, prepare_universe
 
 
 @dataclass
@@ -56,7 +56,8 @@ class StressResult:
         if self.realistic.total_return <= 0:
             verdict = "Strateji gerçekçi maliyetlerle ZATEN kârsız: kâğıt üstündeki kâr maliyetlere gidiyor."
         elif math.isinf(be):
-            verdict = f"Test edilen en kötü senaryoda (+{self.slippage[-1].value:g} bps) bile kârlı."
+            worst = max((r.value for r in self.slippage), default=0)
+            verdict = f"Test edilen en kötü senaryoda (+{worst:g} bps) bile kârlı."
         else:
             verdict = f"Başabaş noktası: dolum başına ~+{be:.1f} bps ek kayma. Bunun üzerinde strateji para kaybeder."
         lines.append("SONUÇ: " + verdict)
@@ -70,6 +71,8 @@ def _row(cfg: Config, frames, scenario: str, value: float) -> StressRow:
 
 
 def _breakeven(rows: list[StressRow]) -> float:
+    """Extra slippage (bps) at which the total return crosses zero, interpolated; rows sorted by value
+    and starting with the realistic (0 bps) scenario."""
     if not rows or rows[0].total_return <= 0:
         return 0.0
     for a, b in zip(rows, rows[1:]):
@@ -78,10 +81,11 @@ def _breakeven(rows: list[StressRow]) -> float:
     return math.inf
 
 
-def stress_test(cfg: Config, data: dict[str, pd.DataFrame], ml_probas: dict[str, pd.Series] | None = None) -> StressResult:
+def stress_test(cfg: Config, data: dict[str, pd.DataFrame], ml_probas: dict[str, pd.Series] | None = None,
+                layers: dict[str, Layers] | None = None) -> StressResult:
     # Portfolio guards are switched off so a kill-switch halt cannot mask the cost effect.
     cfg = cfg.with_overrides({"risk.max_drawdown": 0.99, "risk.daily_loss_limit": 1.0})
-    frames = prepare_universe(data, cfg, ml_probas)  # costs do not change the signals
+    frames = prepare_universe(data, cfg, ml_probas, layers=layers)  # costs do not change the signals
     ideal_cfg = cfg.with_overrides({
         "costs.taker_fee": 0.0, "costs.base_slippage_bps": 0.0, "costs.vol_slippage_coef": 0.0,
         "costs.impact_coef_bps": 0.0, "costs.latency_ms": 0.0, "costs.extra_slippage_bps": 0.0,
@@ -94,5 +98,7 @@ def stress_test(cfg: Config, data: dict[str, pd.DataFrame], ml_probas: dict[str,
         res.latency.append(_row(cfg.with_overrides({"costs.latency_ms": ms}), frames, "latency", ms))
     for bars in cfg.stress.delay_bars:
         res.delay.append(_row(cfg.with_overrides({"costs.execution_delay_bars": bars}), frames, "delay", bars))
-    res.breakeven_extra_bps = _breakeven(res.slippage)
+    # Always measure from the realistic (0 bps) run, whatever grid the user configured.
+    curve = [res.realistic] + [r for r in res.slippage if r.value > 0]
+    res.breakeven_extra_bps = _breakeven(curve)
     return res
