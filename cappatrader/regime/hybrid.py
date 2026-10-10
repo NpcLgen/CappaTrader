@@ -36,7 +36,7 @@ def classify_regime(
     """regime, vol_state, vol_pct, atr_pct and the hmm_* / garch_* columns (NaN when not computed)."""
     base = classify(frame, cfg)
     h = _passthrough(hmm, HMM_COLUMNS, frame.index)
-    h["hmm_label"] = h["hmm_label"].astype(object).where(h["hmm_label"].notna(), UNKNOWN)
+    h["hmm_label"] = h["hmm_label"].to_numpy(dtype=object, na_value=UNKNOWN)
     g = _passthrough(garch, GARCH_COLUMNS, frame.index)
 
     if cfg.method == "hmm":
@@ -47,10 +47,9 @@ def classify_regime(
     vol_state = base["vol_state"].to_numpy(dtype=object).copy()
     if cfg.vol_method == "garch":
         ratio = g["garch_ratio"].to_numpy(dtype=float)
-        known = np.isfinite(ratio)
-        r = np.where(known, ratio, 0.0)
-        garch_state = np.where(r >= cfg.garch.extreme_ratio, VOL_EXTREME,
-                               np.where(r >= cfg.garch.high_ratio, VOL_HIGH, VOL_NORMAL))
+        garch_state = np.where(ratio >= cfg.garch.extreme_ratio, VOL_EXTREME,
+                               np.where(ratio >= cfg.garch.high_ratio, VOL_HIGH, VOL_NORMAL))
+        known = np.isfinite(ratio)  # ATR percentile until the first GARCH fit
         vol_state[known] = garch_state[known]
     vol_state[(regime == HIGH_VOL) & (vol_state == VOL_NORMAL)] = VOL_HIGH
 

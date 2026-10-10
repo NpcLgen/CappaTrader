@@ -45,6 +45,8 @@ class FakeFutures:
         self.pos = dict(positions or {})
         self.wallet = wallet
         self.unavailable = []
+        self.warnings = []
+        self.tp_warning = False
         self.fail_protection = fail_protection
         self.already_closed = already_closed
 
@@ -54,8 +56,9 @@ class FakeFutures:
     async def balance(self):
         return Bal(self.wallet, self.wallet * 0.9)
 
-    async def positions(self):
-        return dict(self.pos)
+    async def positions(self, symbols=None):
+        self.calls.append(("positions", tuple(symbols or ())))
+        return {k: v for k, v in self.pos.items() if symbols is None or k in symbols}
 
     async def market_order(self, symbol, side, qty, ref_price, reduce_only=False):
         self.calls.append(("market", symbol, side, qty, reduce_only))
@@ -67,6 +70,8 @@ class FakeFutures:
         self.calls.append(("protect", symbol, position_side, qty, stop_price, take_profit))
         if self.fail_protection:
             raise RuntimeError("algo order rejected")
+        if self.tp_warning:
+            self.warnings.append(f"{symbol}: borsa kâr al emri konamadı, yalnızca stop aktif")
         return ["s1", "t1"]
 
     async def cancel_protection(self, symbol):
@@ -326,3 +331,64 @@ def test_balance_command_reads_binance(tmp_path, monkeypatch, capsys):
     assert cli.main(["--config", str(cfg_file), "balance"]) == 0
     out = capsys.readouterr().out
     assert "1,195.00 USDT" in out and "42.50 USDT" in out and "-5.00 USDT" in out
+
+
+def test_reconcile_tracks_held_symbols_and_reprotects(live_mode_cfg, universe):
+    fut = FakeFutures()
+
+    async def scenario():
+        eng = _engine(live_mode_cfg, universe, fut)
+        await eng.bootstrap()
+        sym = "BTCUSDT"
+        await _book(eng, sym, eng.last_price[sym])
+        d, row = _decision(eng, live_mode_cfg, sym)
+        await eng.open_position(sym, d, row, {})
+        held = [c for c in fut.calls if c[0] == "positions"][-1][1]
+        assert set(held) >= set(eng.symbols)
+        # the exchange position shrank (e.g. partial manual close): local qty follows and the stop is re-placed
+        fut.pos[sym].qty = eng.account.positions[sym].qty / 2
+        fut.calls.clear()
+        await eng.reconcile_positions()
+        pos = eng.account.positions[sym]
+        assert pos.qty == fut.pos[sym].qty
+        assert [c[0] for c in fut.calls[1:3]] == ["cancel", "protect"] and fut.calls[2][3] == pos.qty
+        return eng
+
+    asyncio.run(scenario())
+
+
+def test_failed_protection_on_restart_is_retried_each_sync(live_mode_cfg, universe):
+    orphan = XPos("ETHUSDT", SHORT, 0.5, float(universe["ETHUSDT"]["close"].iloc[-2]))
+    fut = FakeFutures(positions={"ETHUSDT": orphan}, fail_protection=True)
+
+    async def scenario():
+        eng = _engine(live_mode_cfg, universe, fut)
+        await eng.bootstrap()
+        assert "ETHUSDT" in eng.unprotected and "ETHUSDT" in eng.account.positions
+        assert sum("Koruma emri yerleştirilemedi" in m for m in eng.notifier.messages) == 1
+        assert sum(c[0] == "protect" for c in fut.calls) == 1  # adopted once, not re-protected again at startup
+        await eng.reconcile_positions()  # still failing: no alert spam
+        assert sum("Koruma emri yerleştirilemedi" in m for m in eng.notifier.messages) == 1
+        fut.fail_protection = False
+        await eng.reconcile_positions()
+        assert not eng.unprotected
+        return eng
+
+    asyncio.run(scenario())
+
+
+def test_broker_warnings_after_connect_reach_telegram(live_mode_cfg, universe):
+    fut = FakeFutures()
+    fut.tp_warning = True
+
+    async def scenario():
+        eng = _engine(live_mode_cfg, universe, fut)
+        await eng.bootstrap()
+        sym = "BTCUSDT"
+        await _book(eng, sym, eng.last_price[sym])
+        d, row = _decision(eng, live_mode_cfg, sym)
+        await eng.open_position(sym, d, row, {})
+        return eng
+
+    eng = asyncio.run(scenario())
+    assert any("kâr al emri konamadı" in m for m in eng.notifier.messages) and not eng.futures.warnings

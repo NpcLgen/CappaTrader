@@ -10,23 +10,26 @@ GARCH recursion so the value at bar t uses returns <= t only:
 from __future__ import annotations
 
 import logging
-import warnings
+import math
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from arch import arch_model
-from arch.utility.exceptions import ConvergenceWarning
 
 from cappatrader.config import GARCHConfig
-from cappatrader.regime.hmm import refit_schedule
+from cappatrader.regime.hmm import refit_buckets, refit_schedule, starts_chunk
 
 log = logging.getLogger(__name__)
 
 PCT = 100.0
 # Near-integrated fits have an ill-defined long-run variance; use the sample variance instead.
 MAX_PERSISTENCE = 0.999
+# omega / (1 - persistence) divides by a small, noisy number: with omega at its lower bound it can
+# land orders of magnitude away from the variance the window actually had (garch_ratio of ~250 for
+# a whole chunk). Outside this factor of the sample variance it is not a credible normal level.
+MAX_LONGRUN_FACTOR = 4.0
 COLUMNS = ["garch_vol", "garch_longrun", "garch_ratio", "garch_size_mult"]
 
 
@@ -57,10 +60,12 @@ def arch_backcast(resids: np.ndarray) -> float:
 
 
 def unconditional_variance(omega: float, alphas: np.ndarray, betas: np.ndarray, sample_var: float) -> float:
+    """omega / (1 - sum(alpha) - sum(beta)); the sample variance for a (near-)integrated fit or when
+    that level is more than MAX_LONGRUN_FACTOR away from the sample variance."""
     persistence = float(np.sum(alphas) + np.sum(betas))
     if persistence < MAX_PERSISTENCE:
         uv = omega / (1.0 - persistence)
-        if np.isfinite(uv) and uv > 0:
+        if np.isfinite(uv) and sample_var / MAX_LONGRUN_FACTOR <= uv <= sample_var * MAX_LONGRUN_FACTOR:
             return float(uv)
     return float(sample_var)
 
@@ -74,9 +79,7 @@ def fit_garch(returns_pct: np.ndarray, cfg: GARCHConfig) -> GARCHParams | None:
     backcast = arch_backcast(y - y.mean())
     model = arch_model(y, mean="Constant", vol="GARCH", p=cfg.p, q=cfg.q, dist="normal", rescale=False)
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", ConvergenceWarning)
-            res = model.fit(disp="off", show_warning=False, backcast=backcast)
+        res = model.fit(disp="off", show_warning=False, backcast=backcast)
     except (ValueError, np.linalg.LinAlgError) as exc:
         log.warning("GARCH eğitimi başarısız: %s", exc)
         return None
@@ -96,8 +99,9 @@ def fit_garch(returns_pct: np.ndarray, cfg: GARCHConfig) -> GARCHParams | None:
 def garch_filter(params: GARCHParams, returns_pct: np.ndarray, init_var: float) -> np.ndarray:
     """Next-step conditional variances: out[t] = Var(r_{t+1} | r_0..r_t), percent^2.
 
-    Pre-sample squared residuals and variances are `init_var`; a missing return is
-    replaced by its expectation (eps^2 = sigma2), so the forecast keeps rolling.
+    Pre-sample squared residuals and variances are `init_var`; a missing or
+    non-finite return is replaced by its expectation (eps^2 = sigma2), so the
+    forecast keeps rolling.
     """
     a = [float(x) for x in params.alphas]
     b = [float(x) for x in params.betas]
@@ -108,7 +112,7 @@ def garch_filter(params: GARCHParams, returns_pct: np.ndarray, init_var: float) 
     r = np.asarray(returns_pct, dtype=float).tolist()
     out = np.empty(len(r))
     for t, x in enumerate(r):
-        e = (x - mu) ** 2 if x == x else s
+        e = (x - mu) ** 2 if math.isfinite(x) else s
         if a:
             eps2 = [e, *eps2[:-1]]
         if b:
@@ -142,8 +146,9 @@ def walk_forward_garch(df: pd.DataFrame, cfg: GARCHConfig) -> pd.DataFrame:
     longrun = np.full(n, np.nan)
     params: GARCHParams | None = None
     origin = 0
-    for rows, start, stop in refit_schedule(np.isfinite(r), cfg.min_train, cfg.train_bars, cfg.retrain_every):
-        new = fit_garch(r[rows], cfg) if len(rows) >= cfg.min_train else None
+    buckets = refit_buckets(df.index, cfg.retrain_every)
+    for rows, start, stop in refit_schedule(np.isfinite(r), cfg.min_train, cfg.train_bars, cfg.retrain_every, buckets):
+        new = fit_garch(r[rows], cfg)
         if new is not None:
             params, origin = new, int(rows[0])
         if params is None:
@@ -154,7 +159,13 @@ def walk_forward_garch(df: pd.DataFrame, cfg: GARCHConfig) -> pd.DataFrame:
 
 
 class OnlineGARCH:
-    """Live counterpart of walk_forward_garch: refit every `retrain_every` closed bars."""
+    """Live counterpart of walk_forward_garch.
+
+    To reproduce the backtest exactly: before scoring a new closed bar, refit when
+    `due(bars)` (first bar of an epoch-anchored chunk) with `fit(bars.iloc[:-1])`, i.e. on
+    the bars before the one being scored; at start-up fit on the bars before
+    `chunk_start(bars.index, retrain_every)`.
+    """
 
     def __init__(self, cfg: GARCHConfig):
         self.cfg = cfg
@@ -165,11 +176,20 @@ class OnlineGARCH:
     def needs_fit(self) -> bool:
         return self.params is None or self.bars_since_fit >= self.cfg.retrain_every
 
+    def due(self, df: pd.DataFrame) -> bool:
+        """Refit before forecasting from the last bar of df? Same epoch-anchored bars as walk_forward_garch."""
+        if self.params is None:
+            return True
+        if refit_buckets(df.index, self.cfg.retrain_every) is None:
+            return self.needs_fit()
+        return starts_chunk(df.index, self.cfg.retrain_every)
+
     def fit(self, df: pd.DataFrame) -> bool:
         r = pct_log_returns(df["close"])
-        rows = np.flatnonzero(np.isfinite(r))[-self.cfg.train_bars:]
+        rows = np.flatnonzero(np.isfinite(r))
         if len(rows) < self.cfg.min_train:
             return False
+        rows = rows[-self.cfg.train_bars:]
         params = fit_garch(r[rows], self.cfg)
         if params is None:
             return False

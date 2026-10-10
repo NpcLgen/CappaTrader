@@ -103,6 +103,8 @@ class LiveEngine:
         self.available: float | None = None
         self.binance_balance_note = ""
         self.entry_lock = asyncio.Lock()
+        self.fit_lock = asyncio.Lock()  # model fits touch process-global state (threadpool limits, warnings)
+        self.unprotected: set[str] = set()  # live positions whose exchange stop could not be placed (retried each sync)
         self.inflight: set[str] = set()
         self.tasks: set[asyncio.Task] = set()
         self.protection = False
@@ -214,12 +216,17 @@ class LiveEngine:
             if self.use_ml:
                 ok = await asyncio.to_thread(self.ml[s].fit, self.bars[s])
                 log.info("%s ML modeli %s", s, "eğitildi" if ok else "eğitilemedi (yetersiz veri)")
-            if s in self.hmm:
-                ok = await asyncio.to_thread(self.hmm[s].fit, self.bars[s])
-                log.info("%s HMM rejim modeli %s", s, "eğitildi" if ok else "eğitilemedi (yetersiz veri)")
-            if s in self.garch:
-                ok = await asyncio.to_thread(self.garch[s].fit, self.bars[s])
-                log.info("%s GARCH modeli %s", s, "eğitildi" if ok else "eğitilemedi (yetersiz veri)")
+            for kind, models, rcfg in (("HMM rejim", self.hmm, cfg.regime.hmm), ("GARCH", self.garch, cfg.regime.garch)):
+                if s not in models:
+                    continue
+                from cappatrader.regime.hmm import chunk_start
+
+                # the backtest scores the current chunk with a fit on the bars before the chunk start
+                cut = chunk_start(self.bars[s].index, rcfg.retrain_every)
+                ok = await asyncio.to_thread(models[s].fit, self.bars[s].iloc[:cut])
+                if not ok:
+                    ok = await asyncio.to_thread(models[s].fit, self.bars[s])
+                log.info("%s %s modeli %s", s, kind, "eğitildi" if ok else "eğitilemedi (yetersiz veri)")
         if self.live:
             await self._connect_futures()
         else:
@@ -281,6 +288,7 @@ class LiveEngine:
         for w in getattr(self.futures, "warnings", None) or []:
             if not any(fmt.pair(s) in w for s in unavailable):  # dropped symbols are already reported
                 self.warnings.append(w)
+        self._broker_warnings(drain_only=True)
         await self.refresh_balance()
         if self._fresh_account and not self.account.positions:
             self._reset_account_balance(self.equity())
@@ -307,6 +315,7 @@ class LiveEngine:
     async def _record_close(self, sym: str, fill: Fill, reason: str) -> None:
         if sym not in self.account.positions:
             return
+        self.unprotected.discard(sym)
         trade = self.account.close_position(sym, fill, reason, _now().isoformat())
         if self.live and self.available is not None:
             self.account.cash = self.available
@@ -333,15 +342,46 @@ class LiveEngine:
         return Fill(symbol=sym, side=side, qty=qty, price=price, ref_price=price, fee=0.0, slippage_bps=0.0,
                     latency_ms=0.0, timestamp=_now())
 
+    def _broker_warnings(self, drain_only: bool = False) -> None:
+        """Forward warnings the broker collected after connect (e.g. take-profit not placed) to Telegram."""
+        pending = getattr(self.futures, "warnings", None)
+        if not isinstance(pending, list):
+            return
+        items, pending[:] = list(pending), []
+        if not drain_only:
+            for w in items:
+                self.alert("Borsa uyarısı", w)
+
     async def _protect(self, pos: Position) -> None:
         if not self.cfg.live.place_exchange_stops:
             return
-        await self.futures.place_protection(pos.symbol, pos.side, pos.qty, pos.stop_price, pos.take_profit)
+        try:
+            await self.futures.place_protection(pos.symbol, pos.side, pos.qty, pos.stop_price, pos.take_profit)
+        finally:
+            self._broker_warnings()
+        self.unprotected.discard(pos.symbol)
+
+    async def _reprotect(self, pos: Position, why: str) -> None:
+        """Replace the exchange stop/target; on failure keep tracking the stop locally and retry each sync."""
+        try:
+            await self.futures.cancel_protection(pos.symbol)
+            await self._protect(pos)
+        except Exception as exc:
+            first = pos.symbol not in self.unprotected
+            self.unprotected.add(pos.symbol)
+            if first:
+                self.alert("Koruma emri yerleştirilemedi",
+                           f"{fmt.pair(pos.symbol)} ({why}): {type(exc).__name__}: {exc}. Stop ve hedef bot tarafından "
+                           "yerel olarak izleniyor; borsa emri her senkronda yeniden denenecek.")
+            else:
+                log.warning("%s koruma emri yine yerleştirilemedi: %s", pos.symbol, exc)
 
     async def reconcile_positions(self, startup: bool = False) -> None:
         """Make the local ledger agree with the exchange: record positions the exchange closed,
         adopt exchange positions the bot does not know (no orphan positions, PRD §6)."""
-        ex = await self.futures.positions()
+        held = list(dict.fromkeys([*self.symbols, *self.account.positions]))
+        ex = await self.futures.positions(held)
+        adopted: set[str] = set()
         for sym, pos in list(self.account.positions.items()):
             if sym in self.inflight:
                 continue
@@ -361,6 +401,9 @@ class LiveEngine:
                 log.warning("%s miktar uyuşmazlığı: yerel %s, borsa %s — borsa esas alındı", sym, pos.qty, e.qty)
                 pos.qty = e.qty
                 self.dirty = True
+                await self._reprotect(pos, "miktar borsaya göre güncellendi")
+            elif sym in self.unprotected:
+                await self._reprotect(pos, "yeniden deneme")
         for sym, e in ex.items():
             if sym in self.account.positions or sym in self.inflight:
                 continue
@@ -374,18 +417,12 @@ class LiveEngine:
                        f"{fmt.pair(sym)} {'LONG' if e.side == LONG else 'SHORT'} {fmt.qty(e.qty)} @ {fmt.price(e.entry_price)}; "
                        f"stop {fmt.price(pos.stop_price)}" + (f", hedef {fmt.price(pos.take_profit)}" if pos.take_profit else ""),
                        "ADOPT")
-            try:
-                await self.futures.cancel_protection(sym)
-                await self._protect(pos)
-            except Exception as exc:
-                self.alert("Koruma emri yerleştirilemedi", f"{fmt.pair(sym)}: {exc}")
+            adopted.add(sym)
+            await self._reprotect(pos, "devralınan pozisyon")
         if startup:
-            for sym, pos in self.account.positions.items():
-                try:
-                    await self.futures.cancel_protection(sym)
-                    await self._protect(pos)
-                except Exception as exc:
-                    self.alert("Koruma emri yerleştirilemedi", f"{fmt.pair(sym)}: {exc}")
+            for sym, pos in list(self.account.positions.items()):
+                if sym not in adopted:
+                    await self._reprotect(pos, "yeniden başlatma")
 
     # -- stream handlers -----------------------------------------------------
     async def on_stream(self, stream: str, data: dict) -> None:
@@ -506,13 +543,17 @@ class LiveEngine:
 
     # -- decisions -------------------------------------------------------------
     async def _live_layers(self, sym: str, bars: pd.DataFrame) -> dict:
-        """Single-bar HMM / GARCH layers from the online models (only the last row is filled)."""
+        """Single-bar HMM / GARCH layers from the online models (only the last row is filled).
+
+        A refit only sees the bars before the one being scored, like the walk-forward backtest."""
         layers: dict = {}
+        history = bars.iloc[:-1]
         if sym in self.hmm:
             m = self.hmm[sym]
             m.bars_since_fit += 1
-            if m.needs_fit():
-                await asyncio.to_thread(m.fit, bars)
+            if m.due(bars):
+                async with self.fit_lock:
+                    await asyncio.to_thread(m.fit, history)
             label, prob, state = m.infer_last(bars)
             h = pd.DataFrame({"hmm_state": np.nan, "hmm_label": "UNKNOWN", "hmm_prob": np.nan}, index=bars.index)
             h.iloc[-1] = [state, label, prob]
@@ -520,8 +561,9 @@ class LiveEngine:
         if sym in self.garch:
             g = self.garch[sym]
             g.bars_since_fit += 1
-            if g.needs_fit():
-                await asyncio.to_thread(g.fit, bars)
+            if g.due(bars):
+                async with self.fit_lock:
+                    await asyncio.to_thread(g.fit, history)
             vals = g.forecast_last(bars)
             gdf = pd.DataFrame(np.nan, index=bars.index, columns=GARCH_COLS)
             gdf.iloc[-1] = [vals.get(c, np.nan) for c in GARCH_COLS]
@@ -552,7 +594,8 @@ class LiveEngine:
             model = self.ml[sym]
             model.bars_since_fit += 1
             if model.needs_fit():
-                await asyncio.to_thread(model.fit, bars)
+                async with self.fit_lock:
+                    await asyncio.to_thread(model.fit, bars)
             p = model.predict_last(bars)
             proba = pd.Series(np.nan, index=bars.index)
             proba.iloc[-1] = p
@@ -677,6 +720,8 @@ class LiveEngine:
                 self.alert("Pozisyon kapatılamadı",
                            f"{fmt.pair(sym)}: {type(exc).__name__}: {exc}. Borsadaki stop emri pozisyonu korumaya devam ediyor.")
                 return
+            finally:
+                self._broker_warnings()
             if fill is None:
                 fill = await self.futures.last_close_fill(sym, _ms(pos.entry_time), pos.side)
                 reason = f"{reason} (pozisyon borsada zaten kapanmıştı)"
