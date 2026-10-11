@@ -255,3 +255,23 @@ def test_open_orders_fill_before_any_intrabar_exit_of_the_same_bar(cfg, universe
         elif ts in seen_intrabar:
             mixed += 1
     assert len({ts for ts, *_ in log}) > 50 and mixed == 0
+
+
+@pytest.mark.parametrize("strategy", ["squeeze_vwap", "ensemble"])
+def test_chained_runs_reproduce_one_continuous_run(cfg, universe, strategy):
+    # walk-forward chains its OOS windows: with fixed parameters that must equal one long run, trade for trade
+    c = cfg.with_overrides({"account.allow_short": True, "strategy.name": strategy, "signals.ml.enabled": False,
+                            "risk.max_drawdown": 0.99, "risk.daily_loss_limit": 1.0})
+    frames = prepare_universe(universe, c)
+    idx = frames["BTCUSDT"].index
+    s, m1, m2, e = idx[600], idx[1300], idx[1900], idx[-1]
+    whole = Backtester(c).run(frames, s, e, collect_reasons=False)
+    a = Backtester(c).run(frames, s, m1, collect_reasons=False, liquidate=False)
+    b = Backtester(c).run(frames, m1, m2, collect_reasons=False, account=a.account, liquidate=False,
+                          pending=a.pending, last_prices=a.last_prices, last_exit=a.last_exit)
+    z = Backtester(c).run(frames, m2, e, collect_reasons=False, account=b.account, pending=b.pending,
+                          last_prices=b.last_prices, last_exit=b.last_exit)
+    key = lambda t: (t.symbol, t.side, t.entry_time, t.exit_time, round(t.qty, 12), t.exit_reason)  # noqa: E731
+    chained = z.account.trades
+    assert len(whole.trades) > 20 and [key(t) for t in chained] == [key(t) for t in whole.trades]
+    assert z.equity.iloc[-1] == pytest.approx(whole.equity.iloc[-1], rel=1e-12)

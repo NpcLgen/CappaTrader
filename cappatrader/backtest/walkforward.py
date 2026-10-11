@@ -117,7 +117,7 @@ def walk_forward(
 
     windows: list[WindowResult] = []
     oos_curves, oos_trades, oos_events = [], [], []
-    acct, carry = None, None
+    acct, carry, last_prices, last_exit = None, None, None, None
     start = 0
     while start + wf.is_bars + wf.oos_bars <= n:
         is_s, is_e = master[start], master[start + wf.is_bars]
@@ -137,8 +137,9 @@ def walk_forward(
         # one continuous OOS account: positions and orders cross window boundaries, only the last
         # window liquidates (a live account is not flattened when the parameters are re-optimised)
         last_window = start + wf.oos_bars + wf.is_bars + wf.oos_bars > n
-        oos = Backtester(c).run(frames, oos_s, oos_e, account=acct, liquidate=last_window, pending=carry)
-        acct, carry = oos.account, oos.pending
+        oos = Backtester(c).run(frames, oos_s, oos_e, account=acct, liquidate=last_window, pending=carry,
+                                last_prices=last_prices, last_exit=last_exit)
+        acct, carry, last_prices, last_exit = oos.account, oos.pending, oos.last_prices, oos.last_exit
         oos_events.extend(oos.events)
         windows.append(WindowResult(len(windows), is_s, is_e, oos_s, oos_e, combo, is_m, oos.metrics))
         oos_curves.append(oos.equity)
