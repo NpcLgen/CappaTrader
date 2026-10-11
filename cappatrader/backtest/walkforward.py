@@ -11,6 +11,7 @@ performance. If it is not profitable, the in-sample optimum was curve fitting.
 from __future__ import annotations
 
 import itertools
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -24,9 +25,15 @@ from cappatrader.config import Config
 from cappatrader.models import Trade
 from cappatrader.strategy.pipeline import Layers, prepare_universe
 
+log = logging.getLogger(__name__)
+
 # Params that change the prepared frame; everything else (risk, ensemble
 # thresholds, costs) only changes how the backtester acts on it.
-_FRAME_PREFIXES = ("signals.", "regime.", "ensemble.weights", "pairs", "strategy.squeeze.")
+_FRAME_PREFIXES = ("signals.", "regime.", "ensemble.weights", "pairs")
+# squeeze settings that change the prepared frame (indicator columns); the rest (stop, target, triggers,
+# confirm bars, tradeable regimes) only change how the engine acts on it, so frames are shared across them
+_FRAME_SQUEEZE = {f"strategy.squeeze.{k}" for k in ("length", "bb_mult", "kc_mult", "calc_mode", "fixed_val",
+                                                     "dyn_mult", "perc_val", "vwap_anchor", "vwap_rolling_bars")}
 
 
 @dataclass
@@ -72,7 +79,7 @@ def _fmt_params(p: dict[str, Any]) -> str:
 
 
 def _frame_key(combo: dict[str, Any]) -> tuple:
-    return tuple(sorted((k, v) for k, v in combo.items() if k.startswith(_FRAME_PREFIXES)))
+    return tuple(sorted((k, repr(v)) for k, v in combo.items() if k.startswith(_FRAME_PREFIXES) or k in _FRAME_SQUEEZE))
 
 
 def _objective(m: dict, name: str, min_trades: int) -> float:
@@ -102,18 +109,23 @@ def walk_forward(
 
     keys = list(wf.grid)
     combos = [dict(zip(keys, vals)) for vals in itertools.product(*(wf.grid[k] for k in keys))] or [{}]
-    cfgs, frame_cache = [], {}
+    cfgs, frame_cache, rejected = [], {}, []
     for combo in combos:
         try:
             c = cfg.with_overrides(combo)
-        except ValueError:
-            continue  # e.g. ema_fast >= ema_slow
+        except ValueError as exc:  # e.g. ema_fast >= ema_slow, or a typo in a grid key
+            rejected.append(f"{_fmt_params(combo)}: {str(exc).splitlines()[-1].strip(' -')}")
+            continue
         key = _frame_key(combo)
         if key not in frame_cache:
             # A grid over regime.* changes the HMM/GARCH layers themselves: recompute them.
             reuse = layers if not any(k.startswith("regime.") for k in combo) else None
             frame_cache[key] = prepare_universe(data, c, ml_probas, layers=reuse)
         cfgs.append((combo, c, frame_cache[key]))
+    if rejected:
+        log.warning("Walk-forward ızgarasında geçersiz %d kombinasyon atlandı: %s", len(rejected), "; ".join(rejected[:5]))
+    if not cfgs:
+        raise ValueError("walkforward.grid içindeki hiçbir kombinasyon geçerli değil: " + "; ".join(rejected[:5]))
 
     windows: list[WindowResult] = []
     oos_curves, oos_trades, oos_events = [], [], []
@@ -160,7 +172,11 @@ def walk_forward(
     wfe = float(np.mean(oos_ann) / mean_is) if mean_is > 0 else float("nan")
 
     reasons, ok = [], True
-    if oos_m.get("total_return", 0.0) <= 0:
+    if not oos_trades:
+        ok = False
+        reasons.append("OOS'ta hiç işlem yok: sonuç çıkarılamaz (veri HMM/GARCH ısınması için kısa olabilir, "
+                       "kill-switch erken tetiklenmiş olabilir veya hiçbir bar giriş koşulunu sağlamadı)")
+    elif oos_m.get("total_return", 0.0) <= 0:
         ok = False
         why = ("IS'te de kârsız: stratejide avantaj yok" if mean_is <= 0
                else "IS'te kârlı, OOS'ta değil: parametreler geçmişe aşırı uyarlanmış")

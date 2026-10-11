@@ -243,3 +243,80 @@ def test_removed_symbol_with_open_position_is_still_managed(live_cfg, universe, 
     eng = asyncio.run(scenario())
     assert "SOLUSDT" in eng.symbols and "SOLUSDT" in eng.manage_only and "SOLUSDT" in eng.bars
     assert any("yalnızca stop/hedef takibi" in w for w in eng.warnings)
+
+
+def test_streamed_bars_drive_the_same_decisions_as_the_backtest(cfg, universe, monkeypatch):
+    """The live decision loop (on_kline -> on_bar_close: online HMM/GARCH refits, prepare_universe on the
+    rolling buffer, decide, entries) must reproduce the backtest's view of every bar (CLAUDE.md parity)."""
+    import math
+
+    import cappatrader.live.runner as runner
+    from cappatrader.strategy.decision import FrameView
+    from cappatrader.strategy.factory import decide, make_decider
+    from cappatrader.strategy.pipeline import prepare_universe
+
+    c = cfg.with_overrides({"account.allow_short": True, "data.tick_max_deviation": 0.5})
+    c.symbols, c.pairs = ["BTCUSDT"], []
+    df, n_feed = universe["BTCUSDT"], 300
+
+    class StreamREST(FakeREST):
+        async def recent_klines(self, symbol, tf, n):
+            return self.u[symbol].iloc[-n_feed - n:-n_feed]
+
+    seen, opened = {}, []
+    orig_decide = runner.decide
+
+    def spy(decider, cfg_, sym, v, i, pos, bse):
+        d = orig_decide(decider, cfg_, sym, v, i, pos, bse)
+        seen[v.index[i]] = (d.regime, d.vol_state, d.size_mult, d.atr, decider._entry_action(v, i, d))
+        return d
+
+    monkeypatch.setattr(runner, "decide", spy)
+
+    def kline(ts, row):
+        return {"t": int(ts.value // 1_000_000), "o": row.open, "h": row.high, "l": row.low, "c": row.close,
+                "v": row.volume, "q": row.quote_volume, "V": 0.0, "x": True}
+
+    async def scenario():
+        eng = LiveEngine(c, rest=StreamREST(universe), notifier=CaptureNotifier(), store=StateStore(":memory:"))
+        await eng.bootstrap()
+        orig_open = eng.open_position
+
+        async def spy_open(sym, d, row, notes):
+            opened.append(d)
+            return await orig_open(sym, d, row, notes)
+
+        eng.open_position = spy_open
+        for j in range(n_feed, 0, -1):
+            await eng.on_stream("btcusdt@kline_1h", {"k": kline(df.index[-j], df.iloc[-j])})
+            if eng.tasks:
+                await asyncio.gather(*list(eng.tasks))
+        return eng
+
+    asyncio.run(scenario())
+    frame = prepare_universe({"BTCUSDT": df}, c)["BTCUSDT"]
+    v, dec = FrameView(frame), make_decider(c)
+    assert len(seen) == n_feed
+    for ts, (regime, vol, mult, atr, entry) in seen.items():
+        i = frame.index.get_loc(ts)
+        d = decide(dec, c, "BTCUSDT", v, i, None, None)
+        assert (d.regime, d.vol_state, dec._entry_action(v, i, d)) == (regime, vol, entry), ts
+        assert math.isclose(d.atr, atr, rel_tol=1e-9), ts
+        assert (math.isnan(d.size_mult) and math.isnan(mult)) or math.isclose(d.size_mult, mult, rel_tol=1e-9), ts
+    assert sum(e is not None for *_, e in seen.values()) > 0 and opened  # the loop really trades
+
+
+def test_flash_move_halts_new_entries_for_the_cooldown(live_cfg, universe):
+    eng = LiveEngine(live_cfg, rest=FakeREST(universe), notifier=CaptureNotifier(), store=StateStore(":memory:"))
+    sym = "BTCUSDT"
+    eng._flash_check(sym, 100.0, 1000.0)
+    eng._flash_check(sym, 102.0, 1010.0)
+    assert sym not in eng.account.symbol_halts  # 2% is a normal move
+    eng._flash_check(sym, 100.0 * (1 + live_cfg.risk.flash_move_pct + 0.01), 1020.0)
+    assert sym in eng.account.symbol_halts and any("flash" in m.lower() for m in eng.notifier.messages)
+    assert not eng._entry_ok(sym) and eng._entry_ok("ETHUSDT")
+    eng.account.symbol_halts[sym] = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=1)).isoformat()
+    assert eng._entry_ok(sym)  # cooldown over
+    halted_until = eng.account.symbol_halts[sym]
+    eng._flash_check(sym, 100.0, 1020.0 + live_cfg.risk.flash_window_s + 5)  # the spike left the window
+    assert eng.account.symbol_halts[sym] == halted_until and eng._entry_ok(sym)

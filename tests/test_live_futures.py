@@ -726,3 +726,21 @@ def test_daily_summary_names_the_account():
 
     text = msg.daily_summary("2026-10-11", 1000.0, 900.0, 1000.0, 1000.0, {}, {}, [], mode="CANLI · DEMO (sanal para)")
     assert "CANLI · DEMO" in text.splitlines()[0]
+
+
+def test_adopting_on_a_symbol_without_atr_uses_a_finite_fallback(live_mode_cfg, universe):
+    import math
+
+    short = {s: df.iloc[:12] for s, df in universe.items()}  # a listing too new for a 14-bar ATR
+    px = float(short["ETHUSDT"]["close"].iloc[-2])
+    fut = FakeFutures(positions={"ETHUSDT": XPos("ETHUSDT", 1, 0.5, px)})
+
+    async def scenario():
+        eng = _engine(live_mode_cfg, short, fut)
+        await eng.bootstrap()
+        return eng
+
+    eng = asyncio.run(scenario())
+    pos = eng.account.positions["ETHUSDT"]
+    assert all(math.isfinite(x) for x in (pos.stop_price, pos.take_profit, pos.risk_per_unit))
+    assert pos.stop_price < pos.entry_price < pos.take_profit

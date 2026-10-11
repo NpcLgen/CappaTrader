@@ -170,13 +170,19 @@ def test_reports_are_strict_json(tmp_path):
     assert data == {"a": None, "b": [None, 1.5], "c": {"d": None}}
 
 
-def test_stress_breakeven_uses_realistic_baseline(cfg, universe):
+def test_stress_breakeven_uses_realistic_baseline(cfg, universe, monkeypatch):
+    import cappatrader.backtest.stress as stress
+
+    returns = {("ideal", 0): 0.3, ("realistic", 0): 0.10, ("slippage", 20): -0.10, ("slippage", 30): -0.20}
+
+    def fake_row(cfg_, frames, scenario, value):
+        return stress.StressRow(scenario, value, returns.get((scenario, value), 0.0), 0.0, 0.0, 1.0, 10, 0.0, 0.0)
+
+    monkeypatch.setattr(stress, "_row", fake_row)
     c = cfg.with_overrides({"signals.ml.enabled": False})
     c.stress.extra_slippage_bps = [20, 30]  # no 0 entry in the user's grid
     c.stress.latency_ms = [0]
     c.stress.delay_bars = [0]
     res = stress_test(c, universe)
-    if res.realistic.total_return > 0:
-        assert res.breakeven_extra_bps > 0
-    else:
-        assert res.breakeven_extra_bps == 0.0
+    # interpolated from the realistic 0-bps run (+10%) to the 20-bps row (-10%); the user's grid alone gives 0
+    assert res.breakeven_extra_bps == pytest.approx(10.0)

@@ -53,7 +53,10 @@ class StressResult:
         lines.append("— Sinyalden sonra bar gecikmesi —")
         lines += [row(r, f"{int(r.value)} bar geç") for r in self.delay]
         be = self.breakeven_extra_bps
-        if self.ideal.total_return <= 0:
+        if self.ideal.trades == 0:
+            verdict = ("Hiç işlem açılmadı: sonuç çıkarılamaz. Veri, HMM/GARCH ısınması için çok kısa olabilir "
+                       "(en az regime.hmm.min_train + feature_window bar) veya hiçbir bar giriş koşulunu sağlamadı.")
+        elif self.ideal.total_return <= 0:
             verdict = ("Strateji maliyetsiz ideal dolumlarla bile kârsız: sinyallerde avantaj yok "
                        "(sorun maliyet değil, stratejinin kendisi).")
         elif self.realistic.total_return <= 0:

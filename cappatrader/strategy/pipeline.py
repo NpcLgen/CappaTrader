@@ -39,7 +39,8 @@ def _layer_key(df: pd.DataFrame, cfg: Config) -> tuple:
     h.update(np.ascontiguousarray(df.index.asi8 if isinstance(df.index, pd.DatetimeIndex) else np.arange(len(df))))
     h.update(np.ascontiguousarray(df["close"].to_numpy(dtype=float)))
     r = cfg.regime
-    return (h.hexdigest(), r.method, r.vol_method, repr(r.hmm), repr(r.garch))
+    tz = str(getattr(df.index, "tz", None))  # a tz-naive copy must not reuse tz-aware layers (reindex mismatch)
+    return (h.hexdigest(), tz, str(df.index.dtype), r.method, r.vol_method, repr(r.hmm), repr(r.garch))
 
 
 def compute_layers(df: pd.DataFrame, cfg: Config) -> Layers:

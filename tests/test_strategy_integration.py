@@ -218,14 +218,19 @@ def test_volatility_multiplier_shrinks_even_when_the_position_cap_binds():
 
 
 def test_walk_forward_keeps_positions_across_oos_windows(cfg, universe):
-    c = cfg.with_overrides({"account.allow_short": True})
-    c.walkforward.is_bars, c.walkforward.oos_bars = 1000, 500
+    # guards off: a kill-switch in window 1 would leave later windows empty and the test vacuous
+    c = cfg.with_overrides({"account.allow_short": True, "risk.max_drawdown": 0.99, "risk.daily_loss_limit": 1.0})
+    c.walkforward.is_bars, c.walkforward.oos_bars = 1000, 300
     c.walkforward.grid = {"strategy.squeeze.atr_stop_mult": [1.0, 2.0]}
     res = walk_forward(c, universe, layers=regime_layers(universe, c))
+    assert len(res.windows) >= 3 and all(w.oos_metrics.get("trades", 0) > 0 for w in res.windows)
+    inner_ends = [pd.Timestamp(w.oos_end) for w in res.windows[:-1]]
+    crossing = [t for t in res.oos_trades
+                if any(pd.Timestamp(t.entry_time) < e <= pd.Timestamp(t.exit_time) for e in inner_ends)]
+    assert crossing  # positions really are carried across a window boundary instead of being closed there
     forced = [t for t in res.oos_trades if t.exit_reason.startswith("Backtest sonu")]
-    last_oos_end = res.windows[-1].oos_end
-    assert all(pd.Timestamp(t.exit_time) >= pd.Timestamp(last_oos_end) - pd.Timedelta(hours=1) for t in forced)
-    assert len(forced) <= len(universe)
+    last_oos_end = pd.Timestamp(res.windows[-1].oos_end)
+    assert all(pd.Timestamp(t.exit_time) >= last_oos_end - pd.Timedelta(hours=1) for t in forced)
 
 
 def test_open_orders_fill_before_any_intrabar_exit_of_the_same_bar(cfg, universe, monkeypatch):
@@ -275,3 +280,51 @@ def test_chained_runs_reproduce_one_continuous_run(cfg, universe, strategy):
     chained = z.account.trades
     assert len(whole.trades) > 20 and [key(t) for t in chained] == [key(t) for t in whole.trades]
     assert z.equity.iloc[-1] == pytest.approx(whole.equity.iloc[-1], rel=1e-12)
+
+
+def test_walk_forward_shares_frames_across_engine_only_parameters(cfg, universe, monkeypatch):
+    import cappatrader.backtest.walkforward as wf
+
+    calls = []
+    orig = wf.prepare_universe
+    monkeypatch.setattr(wf, "prepare_universe", lambda *a, **k: calls.append(1) or orig(*a, **k))
+    c = cfg.with_overrides({"account.allow_short": True})
+    c.walkforward.is_bars, c.walkforward.oos_bars = 1000, 500
+    c.walkforward.grid = {"strategy.squeeze.atr_stop_mult": [1.0, 2.0], "strategy.squeeze.confirm_bars": [1, 2],
+                          "strategy.squeeze.length": [30, 60]}
+    wf.walk_forward(c, universe, layers=regime_layers(universe, c))
+    assert len(calls) == 2  # one frame set per squeeze length; stop / confirm bars only change the engine
+
+
+def test_walk_forward_grid_errors_are_named(cfg, universe):
+    with pytest.raises(ValueError, match="walkforward.grid: bilinmeyen ayar"):
+        cfg.with_overrides({"walkforward.grid": {"strategy.squeeze.atr_stop_multt": [1.0]}})
+    c = cfg.with_overrides({})
+    c.walkforward.is_bars, c.walkforward.oos_bars = 1000, 500
+    c.walkforward.grid = {"strategy.squeeze.take_profit_r": [0.0, -1.0]}
+    with pytest.raises(ValueError, match="hiçbir kombinasyon geçerli değil"):
+        walk_forward(c, universe, layers=regime_layers(universe, c))
+
+
+def test_verdicts_without_trades_draw_no_conclusion(cfg, universe):
+    from cappatrader.backtest.stress import StressResult, StressRow
+
+    zero = StressRow("x", 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0)
+    assert "Hiç işlem açılmadı" in StressResult(zero, zero).summary()
+    c = cfg.with_overrides({"strategy.squeeze.tradeable_regimes": ["TRANSITION"]})  # never produced by the HMM
+    c.walkforward.is_bars, c.walkforward.oos_bars = 1000, 500
+    c.walkforward.grid = {}
+    res = walk_forward(c, universe, layers=regime_layers(universe, c))
+    assert not res.oos_trades and not res.verdict and "hiç işlem yok" in res.verdict_reasons[0]
+
+
+def test_layer_cache_separates_timezones(cfg, universe):
+    from cappatrader.strategy.pipeline import compute_layers
+
+    aware = universe["BTCUSDT"]
+    naive = aware.copy()
+    naive.index = naive.index.tz_localize(None)
+    a, n = compute_layers(aware, cfg), compute_layers(naive, cfg)
+    assert n["hmm"].index.tz is None and a["hmm"].index.tz is not None
+    f = prepare_universe({"BTCUSDT": naive}, cfg)["BTCUSDT"]
+    assert f["hmm_prob"].notna().sum() > 1000

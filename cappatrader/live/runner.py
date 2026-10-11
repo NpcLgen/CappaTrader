@@ -216,7 +216,9 @@ class LiveEngine:
             self.bars[s] = df
             self.last_price[s] = float(df["close"].iloc[-1])
             self.last_seen[s] = time.monotonic()
-            self.last_atr[s] = float(atr_ind(df["high"], df["low"], df["close"], cfg.regime.atr_period).iloc[-1])
+            atr0 = float(atr_ind(df["high"], df["low"], df["close"], cfg.regime.atr_period).iloc[-1]) if len(df) else np.nan
+            if math.isfinite(atr0):
+                self.last_atr[s] = atr0
             log.info("%s: %d bar yüklendi (%s)", s, len(df), rep)
         for s in self.symbols:
             if self.use_ml:
@@ -349,7 +351,9 @@ class LiveEngine:
             len(self.account.positions), self.account.trades, mode=self.cfg.mode_label))
 
     def _adopt(self, sym: str, side: int, qty: float, entry: float) -> Position:
-        atr = self.last_atr.get(sym, 0.0) or entry * 0.01
+        atr = self.last_atr.get(sym, 0.0)
+        if not (math.isfinite(atr) and atr > 0):  # a brand-new listing has no ATR yet: 1% of the entry
+            atr = entry * 0.01
         dist = self.rcfg.atr_stop_mult * atr
         tp_r = self.rcfg.take_profit_r
         px = self.last_price.get(sym) or entry

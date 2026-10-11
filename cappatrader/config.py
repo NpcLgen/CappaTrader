@@ -458,6 +458,13 @@ class Config:
             # pairs only feed the ensemble's stat-arb signal; squeeze_vwap ignores them (symbols: [BTCUSDT] is fine)
             if len(pair) != 2 or (self.strategy.name == "ensemble" and any(s not in self.symbols for s in pair)):
                 errors.append(f"pairs: {pair} iki geçerli sembol içermeli")
+        for key in self.walkforward.grid:  # a typo here would only surface after hours of model fitting
+            obj: Any = self
+            for part in str(key).split("."):
+                if not hasattr(obj, part):
+                    errors.append(f"walkforward.grid: bilinmeyen ayar {key}")
+                    break
+                obj = getattr(obj, part)
         known = {"TREND_UP", "TREND_DOWN", "RANGE", "TRANSITION", "HIGH_VOL"}
         bad = [r for r in self.strategy.squeeze.tradeable_regimes if r not in known]
         if bad or not self.strategy.squeeze.tradeable_regimes:
