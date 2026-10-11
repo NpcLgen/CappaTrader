@@ -7,7 +7,9 @@ name = "cappatrader"
 version = "0.1.0"
 description = "Kantitatif algoritmik trading sistemi: rejim tespiti, ensemble sinyal, dinamik risk, walk-forward ve slippage simülasyonu"
 readme = "README.md"
-requires-python = ">=3.11"
+# <3.14: hmmlearn 0.3.3 ships no wheels for Python 3.14 yet; there pip would try to compile it
+# (needs a C++ compiler, fails on a plain Windows install). Use Python 3.11-3.13.
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "numpy>=1.26",
     "pandas>=2.1",

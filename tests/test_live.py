@@ -320,3 +320,38 @@ def test_flash_move_halts_new_entries_for_the_cooldown(live_cfg, universe):
     halted_until = eng.account.symbol_halts[sym]
     eng._flash_check(sym, 100.0, 1020.0 + live_cfg.risk.flash_window_s + 5)  # the spike left the window
     assert eng.account.symbol_halts[sym] == halted_until and eng._entry_ok(sym)
+
+
+def test_ctrl_c_stops_gracefully_without_loop_signal_handlers(live_cfg, universe, tmp_path, monkeypatch):
+    """Windows event loops have no add_signal_handler: Ctrl+C must still stop the bot cleanly."""
+    import signal
+
+    live_cfg.runtime.state_db = str(tmp_path / "s.sqlite")
+
+    def unsupported(self, *a, **k):
+        raise NotImplementedError
+
+    monkeypatch.setattr(asyncio.AbstractEventLoop, "add_signal_handler", unsupported)
+    for cls in type(asyncio.new_event_loop()).__mro__:  # the concrete loop class overrides the method
+        if "add_signal_handler" in cls.__dict__:
+            monkeypatch.setattr(cls, "add_signal_handler", unsupported)
+    before = signal.getsignal(signal.SIGINT)
+
+    class SlowREST(FakeREST):
+        async def recent_klines(self, symbol, tf, n):
+            await asyncio.sleep(30)
+            return await super().recent_klines(symbol, tf, n)
+
+    async def scenario():
+        eng = LiveEngine(live_cfg, rest=SlowREST(universe), notifier=CaptureNotifier(),
+                         store=StateStore(live_cfg.runtime.state_db))
+        task = asyncio.create_task(eng.run())
+        await asyncio.sleep(0.5)
+        signal.raise_signal(signal.SIGINT)  # what Ctrl+C does
+        await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(scenario())
+    from cappatrader.live.lock import running_pid
+
+    assert running_pid(live_cfg.state_db) is None  # shutdown ran: the lock is released
+    assert signal.getsignal(signal.SIGINT) == before  # the previous handler is restored

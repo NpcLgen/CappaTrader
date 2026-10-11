@@ -525,7 +525,20 @@ COMMANDS = {
 }
 
 
+def _safe_console() -> None:
+    """Never crash on a character the console cannot show: Windows code pages (cp1254, cp857...) lack
+    the box-drawing and some symbols used in reports when output is piped or redirected."""
+    for stream in (sys.stdout, sys.stderr):
+        enc = (getattr(stream, "encoding", None) or "").lower().replace("-", "").replace("_", "")
+        if enc not in ("utf8", "utf8sig") and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _safe_console()
     args = build_parser().parse_args(argv)
     try:
         cfg = load_config(args.config)

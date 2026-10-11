@@ -1013,11 +1013,18 @@ class LiveEngine:
     async def run(self) -> None:
         self.stop_event = asyncio.Event()
         loop = asyncio.get_running_loop()
+        self._prev_signals: dict = {}
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, self.stop_event.set)
             except (NotImplementedError, RuntimeError):
-                pass
+                # Windows has no loop signal handlers: a plain handler wakes the loop, so Ctrl+C still
+                # stops the bot gracefully (orders finish, state is saved, the lock is released)
+                try:
+                    self._prev_signals[sig] = signal.signal(
+                        sig, lambda *_: loop.call_soon_threadsafe(self.stop_event.set))
+                except (ValueError, OSError):  # not the main thread
+                    pass
         self.lock.acquire()
         await self.notifier.start()
         boot = asyncio.create_task(self.bootstrap(), name="bootstrap")
@@ -1105,3 +1112,9 @@ class LiveEngine:
         except Exception:
             pass
         self.lock.release()
+        for sig, prev in getattr(self, "_prev_signals", {}).items():
+            try:
+                signal.signal(sig, prev)
+            except (ValueError, OSError, TypeError):
+                pass
+        self._prev_signals = {}

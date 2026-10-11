@@ -278,10 +278,12 @@ def _hold_lock_in_child(db: str, pid_text: str = "1"):
     import sys
     import time
 
-    code = ("import fcntl, os, sys, time; fd = os.open(sys.argv[1] + '.lock', os.O_RDWR | os.O_CREAT, 0o644); "
-            "fcntl.flock(fd, fcntl.LOCK_EX); os.ftruncate(fd, 0); os.write(fd, sys.argv[2].encode()); "
-            "print('locked', flush=True); time.sleep(60)")
-    child = subprocess.Popen([sys.executable, "-c", code, db, pid_text], stdout=subprocess.PIPE, text=True)
+    code = ("import os, sys, time; from cappatrader.live.lock import RunLock; lock = RunLock(sys.argv[1]); "
+            "lock.acquire(); os.lseek(lock._fd, 0, 0); os.ftruncate(lock._fd, 0); "
+            "os.write(lock._fd, sys.argv[2].encode()); print('locked', flush=True); time.sleep(60)")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # works on Linux, macOS and Windows
+    child = subprocess.Popen([sys.executable, "-c", code, db, pid_text], stdout=subprocess.PIPE, text=True,
+                             cwd=root)
     assert child.stdout.readline().strip() == "locked"
     time.sleep(0.05)
     return child
@@ -884,12 +886,45 @@ def test_lock_falls_back_when_the_filesystem_cannot_flock(tmp_path, monkeypatch)
 
     import cappatrader.live.lock as lockmod
 
-    def no_flock(fd, op):
+    def no_lock(fd, shared=False):
         raise OSError(errno.ENOLCK, "No locks available")
 
-    monkeypatch.setattr(lockmod.fcntl, "flock", no_flock)
+    monkeypatch.setattr(lockmod, "_os_lock", no_lock)
     db = str(tmp_path / "s.sqlite")
     lock = RunLock(db)
     lock.acquire()  # not refused as "already running"
     assert running_pid(db) is None  # our own PID in the file: nobody else holds it
     lock.release()
+
+
+def test_windows_lock_path_uses_msvcrt_and_keeps_the_pid_readable(tmp_path, monkeypatch):
+    import errno
+
+    import cappatrader.live.lock as lockmod
+
+    class FakeMsvcrt:  # msvcrt.locking semantics: a byte range at the current position, held -> EACCES
+        LK_NBLCK, LK_UNLCK = 2, 0
+
+        def __init__(self):
+            self.held_by_other, self.calls = False, []
+
+        def locking(self, fd, mode, nbytes):
+            self.calls.append((mode, os.lseek(fd, 0, os.SEEK_CUR), nbytes))
+            if mode == self.LK_NBLCK and self.held_by_other:
+                raise OSError(errno.EACCES, "Permission denied")
+
+    fake = FakeMsvcrt()
+    monkeypatch.setattr(lockmod, "fcntl", None)
+    monkeypatch.setattr(lockmod, "msvcrt", fake)
+    db = str(tmp_path / "s.sqlite")
+    lock = RunLock(db)
+    lock.acquire()
+    assert fake.calls[0] == (fake.LK_NBLCK, lockmod._WIN_OFFSET, 1)  # past the PID text
+    assert lockmod._read_pid(lockmod.lock_path(db)) == os.getpid()
+    fake.held_by_other = True
+    with pytest.raises(RuntimeError, match="zaten çalışan bir bot"):
+        RunLock(db).acquire()
+    assert running_pid(db) == os.getpid()  # held: the PID text is still readable
+    fake.held_by_other = False
+    lock.release()
+    assert fake.calls[-1][0] == fake.LK_UNLCK and running_pid(db) is None

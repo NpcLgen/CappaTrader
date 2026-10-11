@@ -53,12 +53,34 @@ Bütün ayarlar `config/config.yaml` dosyasında, `strategy.squeeze` altında.
 
 ## Kurulum
 
+**Python 3.11, 3.12 veya 3.13 gerekir.** Python 3.14 henüz desteklenmiyor: `hmmlearn` paketinin 3.14 için hazır
+paketi yok, pip onu derlemeye çalışır ve C++ derleyicisi olmayan bir bilgisayarda kurulum başarısız olur.
+
+Linux / macOS:
+
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 cp .env.example .env        # anahtarları .env'e yazın, asla commit etmeyin
 python -m pytest -q         # internet gerektirmez
 ```
+
+Windows (PowerShell). `&&` ve `source` PowerShell'de çalışmaz, komutları tek tek girin:
+
+```powershell
+py -0                                   # kurulu Python sürümleri; 3.11-3.13 listede olmalı
+py -3.13 -m venv .venv                  # 3.13 yoksa python.org'dan 3.13 kurun ("Add to PATH" işaretli)
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned   # bir kez: betik çalıştırma izni
+.\.venv\Scripts\Activate.ps1             # satırın başında (.venv) görünmeli
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+Copy-Item .env.example .env
+notepad .env                            # anahtarları yazıp kaydedin
+python -m pytest -q
+```
+
+`py` komutu bulunamazsa Python python.org'dan kurulmamıştır (Microsoft Store sürümü yerine python.org sürümünü
+kullanın). Türkçe karakterler bozuk görünürse önce `chcp 65001` çalıştırın.
 
 `.env`:
 
