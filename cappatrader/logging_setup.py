@@ -41,7 +41,9 @@ class MaskingFormatter(logging.Formatter):
 
 def setup_logging(cfg: Config, verbose: bool = False) -> None:
     root = logging.getLogger()
-    root.handlers.clear()
+    for h in list(root.handlers):  # close (not just drop) earlier handlers: the log file stays open otherwise
+        root.removeHandler(h)
+        h.close()
     root.setLevel(logging.DEBUG if verbose else logging.INFO)
     secrets = [cfg.secrets.binance_api_key, cfg.secrets.binance_secret_key, cfg.secrets.telegram_token]
     fmt = MaskingFormatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", secrets)

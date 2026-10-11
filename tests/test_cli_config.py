@@ -42,7 +42,7 @@ def test_walkforward_refuses_short_history_before_fitting_models(tmp_path, monke
     monkeypatch.setattr(c, "_layers", lambda *a, **k: pytest.fail("models fitted despite too little data"))
     rc = cli.main(["--config", str(_cfg_file(tmp_path)), "walkforward", "--synthetic", "--bars", "1200", "--no-ml"])
     out = capsys.readouterr().out
-    assert rc == 1 and "en az" in out and "--days" in out
+    assert rc == 1 and "en az" in out and "--bars" in out  # synthetic data: --days would not help
 
 
 def test_stress_verdict_distinguishes_no_edge_from_costs():
@@ -60,3 +60,28 @@ def test_alerts_name_the_account(tmp_path):
     eng = LiveEngine(c, rest=object(), notifier=CaptureNotifier(), store=StateStore(":memory:"))
     eng.alert("KILL-SWITCH", "test")
     assert "KAĞIT HESAP" in eng.notifier.messages[-1]
+
+
+def test_walkforward_precheck_counts_the_union_of_bars(tmp_path, monkeypatch, capsys):
+    import pandas as pd
+
+    import cappatrader.cli as c
+    from cappatrader.data.synthetic import generate_universe
+
+    u = generate_universe(["BTCUSDT", "ETHUSDT"], 1200, "1h", seed=3)
+    u["ETHUSDT"] = u["ETHUSDT"].iloc[700:]  # listed later: the union still has 1200 bars
+    monkeypatch.setattr(c, "_data", lambda args, cfg: u)
+    seen = {}
+
+    def fake_wf(cfg, data, *a, **k):
+        seen["called"] = True
+        raise RuntimeError("stop here")
+
+    import cappatrader.backtest.walkforward as wf
+
+    monkeypatch.setattr(wf, "walk_forward", fake_wf)
+    monkeypatch.setattr(c, "_layers", lambda *a, **k: None)
+    body = "symbols: [BTCUSDT, ETHUSDT]\npairs: []\nwalkforward:\n  is_bars: 800\n  oos_bars: 300\n"
+    cli.main(["--config", str(_cfg_file(tmp_path, body)), "walkforward", "--no-ml"])
+    assert seen.get("called")  # 1200 union bars >= 1100: not refused because ETH alone is shorter
+    assert pd.Timestamp(u["ETHUSDT"].index[0]) > pd.Timestamp(u["BTCUSDT"].index[0])

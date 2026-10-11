@@ -297,12 +297,16 @@ class LiveEngine:
                 self.warnings.append(w)
         self._broker_warnings(drain_only=True)
         await self.refresh_balance()
-        if self._fresh_account or (not self.account.trades and not self.account.positions):
-            # a new (or reset, or never-traded) live ledger starts from the real futures equity
-            self._reset_account_balance(self.equity())
+        seed = self._fresh_account or (not self.account.trades and not self.account.positions)
         self.binance_balance_note = (f"Binance futures: cüzdan {fmt.usd(self.wallet or 0)}, "
                                      f"kullanılabilir {fmt.usd(self.available or 0)}")
         await self.reconcile_positions(startup=True)
+        if seed:
+            # a new (or reset, or never-traded) live ledger starts from the real futures equity, measured after
+            # adopting the exchange's positions so their open P&L is not read as a drawdown
+            self._reset_account_balance(self.equity())
+            self.account.cash = self.available if self.available is not None else self.account.cash
+            self.store.save_account(self.account)
         if self.store.get_kv("reseed_peak"):
             # `resume` cannot know the live equity offline: restart the drawdown / daily windows from Binance's
             a, eq = self.account, self.equity()
@@ -349,15 +353,16 @@ class LiveEngine:
         dist = self.rcfg.atr_stop_mult * atr
         tp_r = self.rcfg.take_profit_r
         px = self.last_price.get(sym) or entry
-        anchor, note = entry, "Borsada bulunan sahipsiz pozisyon devralındı"
-        crossed = (px - (entry - side * dist)) * side <= 0 or (tp_r and (entry + side * tp_r * dist - px) * side <= 0)
-        if crossed:
-            # price already moved past the entry-based stop/target: protect from the current price instead
-            # of closing the position on its first tick
-            anchor = px
-            note += f" (fiyat girişten uzaklaştığı için stop/hedef güncel fiyata ({fmt.price(px)}) göre kondu)"
-        stop = anchor - side * dist
-        tp = anchor + side * tp_r * dist if tp_r else None
+        note = "Borsada bulunan sahipsiz pozisyon devralındı"
+        stop, tp = entry - side * dist, (entry + side * tp_r * dist if tp_r else None)
+        # a level the price has already passed would close the position on its first tick: move only that
+        # level to the current price (the target therefore never lands on the losing side of the entry)
+        if (px - stop) * side <= 0:
+            stop = px - side * dist
+            note += f" (fiyat giriş bazlı stopun ötesinde: stop güncel fiyata ({fmt.price(px)}) göre kondu)"
+        if tp is not None and (tp - px) * side <= 0:
+            tp = px + side * tp_r * dist
+            note += f" (fiyat giriş bazlı hedefi geçmiş: hedef güncel fiyata ({fmt.price(px)}) göre kondu)"
         pos = Position(symbol=sym, side=side, qty=qty, entry_price=entry, entry_time=_now().isoformat(),
                        stop_price=stop, initial_stop=stop, risk_per_unit=dist,
                        best_price=entry, entry_regime="UNKNOWN", entry_confidence=0.0, entry_fee=0.0,
@@ -417,8 +422,18 @@ class LiveEngine:
         self.unprotected.discard(pos.symbol)
 
     async def _swap_protection(self, pos: Position) -> None:
-        old = list(self.protection_ids.get(pos.symbol) or [])
-        if old:
+        old: list[str] | None = list(self.protection_ids.get(pos.symbol) or [])
+        if not old:  # unknown (adopted position, reset ledger, first start): ask the exchange what is working
+            lister = getattr(self.futures, "protection_order_ids", None)
+            try:
+                old = list(await lister(pos.symbol)) if lister is not None else None
+            except Exception as exc:
+                log.warning("%s açık koruma emirleri listelenemedi: %s", pos.symbol, exc)
+                old = None
+        if old is not None:
+            if not old:
+                await self._protect(pos)
+                return
             # place the new stop/target first and only then cancel the old ones by id: never a moment
             # without an exchange stop (reduce-only orders cannot over-close the position)
             await self._protect(pos)
@@ -427,7 +442,7 @@ class LiveEngine:
             except Exception as exc:
                 self.stale_orders[pos.symbol] = old
                 log.warning("%s eski koruma emirleri iptal edilemedi (yeniden denenecek): %s", pos.symbol, exc)
-        else:  # unknown existing orders (adopted position, first start): clear the symbol, then place
+        else:  # the working orders could not be listed: clear the symbol, then place (shielded by _guarded)
             await self.futures.cancel_protection(pos.symbol)
             await self._protect(pos)
 
@@ -946,7 +961,8 @@ class LiveEngine:
                 day_trades = [x for x in self.account.trades if x.exit_time.startswith(today)]
                 self.notifier.notify(msg.daily_summary(
                     today, self.equity(), self.cash(), self.account.starting_balance,
-                    self.account.day_start_equity, self.account.positions, self.last_price, day_trades))
+                    self.account.day_start_equity, self.account.positions, self.last_price, day_trades,
+                    mode=cfg.mode_label))
 
     # -- lifecycle ------------------------------------------------------------------
     def _startup_text(self) -> str:

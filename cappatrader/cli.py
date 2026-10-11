@@ -118,12 +118,16 @@ def cmd_walkforward(args, cfg: Config) -> int:
     from cappatrader.backtest.walkforward import walk_forward
 
     data = _data(args, cfg)
-    need, have = cfg.walkforward.is_bars + cfg.walkforward.oos_bars, min((len(d) for d in data.values()), default=0)
-    if have < need:  # say it before the expensive HMM/GARCH layers are fitted
-        days = math.ceil(need * cfg.bar_ms / 86_400_000) + 1
+    need = cfg.walkforward.is_bars + cfg.walkforward.oos_bars
+    master = pd.DatetimeIndex([])
+    for d in data.values():  # walk_forward runs on the union of the symbols' bars
+        master = master.union(d.index)
+    if len(master) < need:  # say it before the expensive HMM/GARCH layers are fitted
+        fix = (f"--bars değerini en az {need} yapın" if args.synthetic else
+               f"--days değerini en az {math.ceil(need * cfg.bar_ms / 86_400_000) + 1} yapın")
         print(f"✘ Walk-forward için en az {need} bar gerekli (IS {cfg.walkforward.is_bars} + OOS "
-              f"{cfg.walkforward.oos_bars}), mevcut {have}. --days değerini en az {days} yapın "
-              "veya walkforward.is_bars / oos_bars değerlerini küçültün.")
+              f"{cfg.walkforward.oos_bars}), mevcut {len(master)}. {fix} veya walkforward.is_bars / oos_bars "
+              "değerlerini küçültün.")
         return 1
     res = walk_forward(cfg, data, _ml(cfg, data), progress=print, layers=_layers(cfg, data))
     text = res.summary()

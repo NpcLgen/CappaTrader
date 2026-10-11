@@ -940,6 +940,15 @@ class BinanceFuturesBroker(BinanceAccountReader):
             if str(o.get("clientOrderId") or "").startswith(CLIENT_ID_PREFIX):
                 await self._cancel(usym, o.get("id"), {})
 
+    async def protection_order_ids(self, symbol: str) -> list[str]:
+        """Ids of the symbol's open conditional (algo) orders, i.e. the protection currently on the exchange.
+
+        fetch_open_orders with trigger=True routes to GET /fapi/v1/openAlgoOrders; ccxt parses algoId as the
+        order id, the same id place_protection returns and cancel_protection(order_ids=...) takes."""
+        usym = self._unified(symbol)
+        orders = await self._call(self.ex.fetch_open_orders, usym, None, None, {"trigger": True})
+        return [str(o["id"]) for o in orders or [] if o.get("id")]
+
     async def _cancel(self, usym: str, order_id: str | None, params: dict[str, Any]) -> None:
         if not order_id:
             return

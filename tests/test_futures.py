@@ -1211,6 +1211,8 @@ class BinanceHTTP:
                 if a["symbol"] == p["symbol"] and a["algoStatus"] == "NEW":
                     a["algoStatus"] = "CANCELED"
             return 200, {"code": 200, "msg": "The operation of cancel all open order is done."}
+        if path == "/fapi/v1/openAlgoOrders" and method == "GET":
+            return 200, [a for a in self.algos.values() if a["symbol"] == p["symbol"] and a["algoStatus"] == "NEW"]
         if path == "/fapi/v1/openOrders":
             return 200, [o for o in self.orders.values() if o["symbol"] == p["symbol"] and o["status"] == "NEW"]
         if path == "/fapi/v1/userTrades":
@@ -1537,3 +1539,26 @@ def test_real_ccxt_paper_mode_balance_reads_the_mainnet_account_read_only():
             ("fapi.binance.com", "/fapi/v1/exchangeInfo"), ("fapi.binance.com", "/fapi/v1/time"), account]
         assert all(r["method"] == "GET" for r in http.requests)
         _signed_ok(http)
+
+
+@pytest.mark.parametrize("env", ["demo", "mainnet"])
+def test_real_ccxt_lists_working_protection_by_algo_id(env):
+    cfg = live_cfg(env, symbols=("BTCUSDT", "ETHUSDT"), leverage=3, margin_mode="isolated")
+    http = BinanceHTTP()
+
+    async def scenario():
+        broker = await _real_broker(cfg, http)
+        try:
+            fill = await broker.market_order("BTCUSDT", LONG, 0.002, 60_000.0)
+            placed = await broker.place_protection("BTCUSDT", LONG, fill.qty, 58_950.0, 62_000.0)
+            listed = await broker.protection_order_ids("BTCUSDT")
+            await broker.cancel_protection("BTCUSDT", listed)
+            return placed, listed, await broker.protection_order_ids("BTCUSDT")
+        finally:
+            await broker.close()
+
+    placed, listed, after = run(scenario())
+    assert sorted(listed) == sorted(placed) and after == []
+    req = [r for r in http.requests if r["path"] == "/fapi/v1/openAlgoOrders"]
+    assert req and req[0]["method"] == "GET" and req[0]["params"]["symbol"] == "BTCUSDT"
+    assert {r["host"] for r in req} == {HOSTS[env][0]}

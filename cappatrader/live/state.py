@@ -37,6 +37,14 @@ class StateStore:
     def close(self) -> None:
         self.conn.close()
 
+    def __del__(self) -> None:  # a store dropped without close() (tests, error paths) still releases the file
+        conn = getattr(self, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def get_kv(self, key: str) -> str | None:
         row = self.conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None

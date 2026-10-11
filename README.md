@@ -117,8 +117,9 @@ Canlı moddaki korumalar:
 - Bakiye her girişten önce Binance'ten okunur. Risk: kasanın yüzdesi / stop mesafesi; kaldıraç yalnızca gereken
   teminatı belirler.
 - Başlangıçta ve 30 saniyede bir pozisyonlar borsayla eşleştirilir. Borsada kapanmış pozisyon işlem kaydına
-  geçer. Botun bilmediği bir pozisyon devralınır ve korunur; fiyat girişten çok uzaklaşmışsa stop ve hedef güncel
-  fiyata göre konur.
+  geçer. Botun bilmediği bir pozisyon devralınır ve korunur. Fiyat giriş bazlı stopu veya hedefi zaten geçmişse
+  yalnızca o seviye güncel fiyata göre konur, böylece hedef hiçbir zaman girişin zarar tarafına düşmez.
+  Pozisyonda daha önceden duran emirler, yeni stop konduktan sonra iptal edilir.
 - Kill-switch açıkken bot, tüm pozisyonlar kapanana kadar kapatmayı tekrar dener.
 - Emir zaman aşımında, tekrar denemeden önce aynı istemci kimliğiyle emir aranır; böylece çift pozisyon açılmaz.
 - Aynı hesap için ikinci bir bot başlatılamaz; bu, aynı `state/` klasörünü paylaşan Docker container'ları için de

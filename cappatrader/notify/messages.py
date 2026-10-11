@@ -108,9 +108,10 @@ def startup_message(symbols: list[str], timeframe: str, equity: float, cash: flo
 
 
 def daily_summary(day: str, equity: float, cash: float, start_balance: float, day_start_equity: float,
-                  positions: dict[str, Position], prices: dict[str, float], day_trades: list[Trade]) -> str:
+                  positions: dict[str, Position], prices: dict[str, float], day_trades: list[Trade],
+                  mode: str = "KAĞIT HESAP") -> str:
     day_ret = equity / day_start_equity - 1 if day_start_equity else 0.0
-    lines = [f"📊 <b>Günlük özet — {escape(day)}</b>",
+    lines = [f"📊 <b>Günlük özet — {escape(day)}</b> · {mode}",
              f"Gün içi: {fmt.pct(day_ret, signed=True)} · kapanan işlem {len(day_trades)} · "
              f"realize {fmt.usd(sum(t.pnl for t in day_trades), signed=True)}"]
     for p in positions.values():

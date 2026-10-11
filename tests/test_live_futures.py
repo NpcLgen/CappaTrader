@@ -49,6 +49,7 @@ class FakeFutures:
         self.tp_warning = False
         self.fail_close = False
         self.fail_cancel = False
+        self.working = {}  # symbol -> ids of conditional orders already on the exchange (e.g. the user's own stop)
         self.fail_protection = fail_protection
         self.already_closed = already_closed
 
@@ -75,6 +76,10 @@ class FakeFutures:
         if self.tp_warning:
             self.warnings.append(f"{symbol}: borsa kâr al emri konamadı, yalnızca stop aktif")
         return ["s1", "t1"]
+
+    async def protection_order_ids(self, symbol):
+        self.calls.append(("list_protection", symbol))
+        return list(self.working.get(symbol, []))
 
     async def cancel_protection(self, symbol, order_ids=None):
         self.calls.append(("cancel", symbol) if order_ids is None else ("cancel_ids", symbol, tuple(order_ids)))
@@ -680,3 +685,44 @@ def test_stale_protection_is_retried_and_cleared_before_a_new_entry(live_mode_cf
         return eng
 
     asyncio.run(scenario())
+
+
+def test_adopted_position_gets_new_stop_before_its_old_orders_are_cancelled(live_mode_cfg, universe):
+    px = float(universe["ETHUSDT"]["close"].iloc[-2])
+    fut = FakeFutures(positions={"ETHUSDT": XPos("ETHUSDT", SHORT, 0.5, px)})
+    fut.working["ETHUSDT"] = ["u1"]  # e.g. the user's own stop on the orphan
+
+    async def scenario():
+        eng = _engine(live_mode_cfg, universe, fut)
+        await eng.bootstrap()
+        return eng
+
+    asyncio.run(scenario())
+    kinds = [c for c in fut.calls if c[0] in ("protect", "cancel", "cancel_ids")]
+    assert [c[0] for c in kinds] == ["protect", "cancel_ids"] and kinds[1][2] == ("u1",)
+
+
+def test_fresh_ledger_is_seeded_after_adopting_an_underwater_orphan(live_mode_cfg, universe):
+    px = float(universe["ETHUSDT"]["close"].iloc[-2])
+    # LONG 2 ETH entered 20% higher: an open loss of about 0.4 x price on the exchange
+    fut = FakeFutures(positions={"ETHUSDT": XPos("ETHUSDT", 1, 2.0, px * 1.25)}, wallet=5000.0)
+
+    async def scenario():
+        eng = _engine(live_mode_cfg, universe, fut)
+        await eng.bootstrap()
+        await eng.check_guards()
+        return eng
+
+    eng = asyncio.run(scenario())
+    a = eng.account
+    assert not a.halted and "ETHUSDT" in a.positions  # its open loss is not a fresh drawdown of this ledger
+    assert a.starting_balance == pytest.approx(eng.equity()) and a.starting_balance < 5000.0
+    pos = a.positions["ETHUSDT"]
+    assert pos.take_profit > pos.entry_price > eng.last_price["ETHUSDT"] > pos.stop_price  # TP never below entry
+
+
+def test_daily_summary_names_the_account():
+    from cappatrader.notify import messages as msg
+
+    text = msg.daily_summary("2026-10-11", 1000.0, 900.0, 1000.0, 1000.0, {}, {}, [], mode="CANLI · DEMO (sanal para)")
+    assert "CANLI · DEMO" in text.splitlines()[0]
