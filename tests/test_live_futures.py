@@ -744,3 +744,23 @@ def test_adopting_on_a_symbol_without_atr_uses_a_finite_fallback(live_mode_cfg, 
     pos = eng.account.positions["ETHUSDT"]
     assert all(math.isfinite(x) for x in (pos.stop_price, pos.take_profit, pos.risk_per_unit))
     assert pos.stop_price < pos.entry_price < pos.take_profit
+
+
+def test_ensemble_bar_close_without_atr_does_not_crash(live_mode_cfg, universe):
+    # a brand-new listing has no finite ATR yet: the trailing-stop update must not raise (it would stop the
+    # engine when it happens inside a reconnect)
+    c = live_mode_cfg.with_overrides({"strategy.name": "ensemble", "signals.ml.enabled": False})
+    c.symbols, c.pairs, c.secrets = ["ETHUSDT"], [], live_mode_cfg.secrets
+    short = {"ETHUSDT": universe["ETHUSDT"].iloc[:13]}
+    px = float(short["ETHUSDT"]["close"].iloc[-2])
+    fut = FakeFutures(positions={"ETHUSDT": XPos("ETHUSDT", 1, 0.5, px)})
+
+    async def scenario():
+        eng = _engine(c, short, fut)
+        await eng.bootstrap()
+        assert "ETHUSDT" not in eng.last_atr and "ETHUSDT" in eng.account.positions
+        await eng.on_bar_close("ETHUSDT", eng.bars["ETHUSDT"].index[-1])
+        return eng
+
+    eng = asyncio.run(scenario())
+    assert eng.account.positions["ETHUSDT"].bars_held == 1

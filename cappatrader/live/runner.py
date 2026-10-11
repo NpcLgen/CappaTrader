@@ -740,7 +740,8 @@ class LiveEngine:
         if pos is not None:
             pos.bars_held += 1
             if self.trailing:
-                update_trailing(pos, float(v["high"][i]), float(v["low"][i]), self.last_atr[sym], self.rcfg)
+                update_trailing(pos, float(v["high"][i]), float(v["low"][i]), self.last_atr.get(sym, 0.0),
+                                self.rcfg)  # no finite ATR yet (new listing): update_trailing skips it
             self.dirty = True
         last_exit = self.account.last_exit.get(sym)
         # bars since the exit, counted like the backtest (exit inside bar k -> 0 at k's close, 1 at k+1's)
