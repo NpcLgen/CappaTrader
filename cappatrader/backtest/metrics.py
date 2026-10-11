@@ -90,8 +90,8 @@ def format_metrics(m: dict, title: str = "Sonuç") -> str:
         f"Sharpe {m['sharpe']:.2f} · Sortino {m['sortino']:.2f} · Max DD {m['max_drawdown'] * 100:.2f}% · Calmar {m['calmar']:.2f}",
         f"İşlem {m['trades']} · kazanma %{m['win_rate'] * 100:.1f} · kâr faktörü {m['profit_factor']:.2f} · "
         f"beklenti {m['expectancy_r']:+.2f}R",
-        f"Brüt P&L {m['gross_pnl']:+,.2f} · komisyon -{m['fees']:,.2f} · slippage maliyeti -{m['slippage_cost']:,.2f} · "
-        f"net {m['net_pnl']:+,.2f} USDT",
+        f"Brüt P&L (kayma dahil) {m['gross_pnl']:+,.2f} · komisyon -{m['fees']:,.2f} · net {m['net_pnl']:+,.2f} USDT "
+        f"(dolum fiyatlarındaki kayma maliyeti {m['slippage_cost']:,.2f} USDT brüte zaten dahil)",
     ]
     if "exposure" in m:
         lines.append(f"Piyasada kalma oranı %{m['exposure'] * 100:.1f}" +

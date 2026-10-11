@@ -33,6 +33,13 @@ REGIME_TR = {
     UNKNOWN: "Belirsiz (yetersiz veri)",
 }
 
+# strategy-neutral names (REGIME_TR's RANGE text describes the ensemble's mean-reversion response)
+REGIME_NAME = {**REGIME_TR, RANGE: "Yatay bant"}
+
+
+def regime_name(regime: str) -> str:
+    return REGIME_NAME.get(regime, regime)
+
 VOL_TR = {
     VOL_NORMAL: "normal",
     VOL_HIGH: "yüksek (pozisyon küçültülür)",

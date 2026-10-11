@@ -455,8 +455,14 @@ class Config:
         if self.regime.adx_range > self.regime.adx_trend:
             errors.append("regime: adx_range <= adx_trend olmalı")
         for pair in self.pairs:
-            if len(pair) != 2 or any(s not in self.symbols for s in pair):
+            # pairs only feed the ensemble's stat-arb signal; squeeze_vwap ignores them (symbols: [BTCUSDT] is fine)
+            if len(pair) != 2 or (self.strategy.name == "ensemble" and any(s not in self.symbols for s in pair)):
                 errors.append(f"pairs: {pair} iki geçerli sembol içermeli")
+        known = {"TREND_UP", "TREND_DOWN", "RANGE", "TRANSITION", "HIGH_VOL"}
+        bad = [r for r in self.strategy.squeeze.tradeable_regimes if r not in known]
+        if bad or not self.strategy.squeeze.tradeable_regimes:
+            errors.append(f"strategy.squeeze.tradeable_regimes: bilinmeyen rejim {bad} (geçerli: {', '.join(sorted(known))})"
+                          if bad else "strategy.squeeze.tradeable_regimes: en az bir rejim gerekli")
         for regime, weights in self.ensemble.weights.items():
             unknown = set(weights) - set(COMPONENTS)
             if unknown:
@@ -483,7 +489,29 @@ def _apply(obj: Any, data: dict[str, Any], path: str = "") -> None:
             for regime, weights in value.items():
                 current.setdefault(regime, {}).update(weights)
         else:
-            setattr(obj, key, value)
+            setattr(obj, key, _typed(full, current, value))
+
+
+_TYPE_TR = {bool: "true/false", int: "tam sayı", float: "sayı", str: "metin", list: "liste", dict: "sözlük"}
+
+
+def _typed(path: str, current: Any, value: Any) -> Any:
+    """YAML value checked against the type of the default (a quoted "3" for a number is a typo)."""
+    if current is None or value is None:
+        return value
+    kind = type(current)
+    ok = (isinstance(value, bool) if kind is bool else
+          isinstance(value, (int, float)) and not isinstance(value, bool) if kind in (int, float) else
+          isinstance(value, kind) if kind in (str, list, dict) else True)
+    if not ok:
+        raise ValueError(f"{path}: {_TYPE_TR.get(kind, kind.__name__)} bekleniyor, {value!r} verildi")
+    if kind is int and isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"{path}: tam sayı bekleniyor, {value!r} verildi")
+        return int(value)
+    if kind is float:
+        return float(value)
+    return value
 
 
 def load_config(path: str | os.PathLike | None = None, env_file: str | None = ".env") -> Config:

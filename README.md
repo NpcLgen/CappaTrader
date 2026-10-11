@@ -144,10 +144,10 @@ veriden geldiği için gerçekçi değil:
 Fiyat: 52,528.22 (sinyal 52,494.72 · slippage 6.4 bps · gecikme 0 ms)
 Miktar: 0.00571 ETH ≈ 299.94 USDT · komisyon 0.30 USDT
 Stop: 51,841.99 (-1.31%) · risk 3.92 USDT (%0.39 kasa) · hedef 53,283.07
-Rejim: Yatay bant (ortalamaya dönüş) · güven %100 · strateji: Squeeze momentum + VWAP
+Rejim: Yatay bant · HMM olasılığı %100 · strateji: Squeeze momentum + VWAP
 
 Neden alındı?
-• Rejim: Yatay bant (ortalamaya dönüş) · HMM olasılığı %100 · volatilite normal · GARCH sonraki bar σ 0.77% (uzun dönem 2.26%, 0.34×) → boyut çarpanı ×1.00
+• Rejim: Yatay bant · HMM olasılığı %100 · volatilite normal · GARCH sonraki bar σ 0.77% (uzun dönem 2.26%, 0.34×) → boyut çarpanı ×1.00
 • ▲ Fiyat günlük VWAP'ın üstünde: kapanış 52,494.72 · VWAP 51,844.06 (+1.26%)
 • ▲ Squeeze momentum -173.5 (sıfırın altında), 1 bardır yükseliyor — alıcı baskısı
 • Squeeze yok: Bollinger bantları Keltner kanalının dışında
@@ -173,7 +173,7 @@ Neden satıldı?
 • Hedef kâr (take-profit) seviyesine ulaşıldı
 
 Giriş gerekçesi (özet)
-• Rejim: Yatay bant (ortalamaya dönüş) · HMM olasılığı %100 · volatilite normal · GARCH sonraki bar σ 0.77% (uzun dönem 2.26%, 0.34×) → boyut çarpanı ×1.00
+• Rejim: Yatay bant · HMM olasılığı %100 · volatilite normal · GARCH sonraki bar σ 0.77% (uzun dönem 2.26%, 0.34×) → boyut çarpanı ×1.00
 • ▲ Fiyat günlük VWAP'ın üstünde: kapanış 52,494.72 · VWAP 51,844.06 (+1.26%)
 • ▲ Squeeze momentum -173.5 (sıfırın altında), 1 bardır yükseliyor — alıcı baskısı
 

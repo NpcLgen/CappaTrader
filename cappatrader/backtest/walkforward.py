@@ -61,7 +61,8 @@ class WalkForwardResult:
                 f"({w.oos_metrics.get('trades', 0)} işlem) | {_fmt_params(w.params)}"
             )
         lines.append(format_metrics(self.oos_metrics, "Birleştirilmiş OOS (hiç görülmemiş veri)"))
-        lines.append(f"Walk-forward verimliliği (OOS/IS yıllık getiri): {self.wfe:.2f}")
+        lines.append("Walk-forward verimliliği (OOS/IS yıllık getiri): "
+                     + (f"{self.wfe:.2f}" if math.isfinite(self.wfe) else "hesaplanamadı (IS getirisi ≤ 0)"))
         lines.append(("SONUÇ: GEÇTİ ✔ — " if self.verdict else "SONUÇ: BAŞARISIZ ✘ — ") + "; ".join(self.verdict_reasons))
         return "\n".join(lines)
 
@@ -160,7 +161,9 @@ def walk_forward(
     reasons, ok = [], True
     if oos_m.get("total_return", 0.0) <= 0:
         ok = False
-        reasons.append(f"OOS toplam getiri {oos_m.get('total_return', 0) * 100:+.2f}% (kârsız: strateji geçmişi ezberlemiş)")
+        why = ("IS'te de kârsız: stratejide avantaj yok" if mean_is <= 0
+               else "IS'te kârlı, OOS'ta değil: parametreler geçmişe aşırı uyarlanmış")
+        reasons.append(f"OOS toplam getiri {oos_m.get('total_return', 0) * 100:+.2f}% ({why})")
     else:
         reasons.append(f"OOS toplam getiri {oos_m['total_return'] * 100:+.2f}%")
     profitable = sum(1 for w in windows if w.oos_metrics.get("total_return", 0) > 0)
@@ -172,7 +175,8 @@ def walk_forward(
         reasons.append(f"kârlı OOS pencere oranı {profitable}/{len(windows)}")
     if not (wfe >= 0.5):
         ok = False
-        reasons.append("walk-forward verimliliği < 0.5 (IS performansı OOS'a taşınmıyor)")
+        reasons.append("walk-forward verimliliği < 0.5 (IS performansı OOS'a taşınmıyor)" if math.isfinite(wfe)
+                       else "walk-forward verimliliği hesaplanamadı (IS getirisi ≤ 0)")
     if oos_m.get("sharpe", 0.0) < 0.5:
         ok = False
         reasons.append(f"OOS Sharpe {oos_m.get('sharpe', 0):.2f} < 0.5")

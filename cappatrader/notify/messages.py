@@ -8,7 +8,7 @@ import pandas as pd
 
 from cappatrader import fmt
 from cappatrader.models import LONG, Decision, Fill, Position, Trade
-from cappatrader.regime.detector import REGIME_TR
+from cappatrader.regime.detector import REGIME_TR, regime_name
 
 
 def _bullets(lines: list[str]) -> str:
@@ -44,7 +44,9 @@ def entry_message(pos: Position, fill: Fill, d: Decision, sizing_notes: list[str
         f"Miktar: {fmt.qty(pos.qty)} {escape(asset)} ≈ {fmt.usd(fill.notional)} · komisyon {fill.fee:.2f} USDT",
         f"Stop: <code>{fmt.price(pos.stop_price)}</code> ({fmt.pct(stop_pct, signed=True)}) · risk {fmt.usd(risk_amt)} "
         f"(%{risk_amt / equity * 100:.2f} kasa)" + (f" · hedef {fmt.price(pos.take_profit)}" if pos.take_profit else ""),
-        f"Rejim: {escape(REGIME_TR.get(d.regime, d.regime))} · güven %{d.confidence:.0f} · strateji: {style}",
+        (f"Rejim: {escape(regime_name(d.regime))} · HMM olasılığı %{d.confidence:.0f} · strateji: {style}"
+         if pos.style == "SQZ" else
+         f"Rejim: {escape(REGIME_TR.get(d.regime, d.regime))} · güven %{d.confidence:.0f} · strateji: {style}"),
         "",
         "<b>Neden alındı?</b>" if long else "<b>Neden açığa satıldı?</b>",
         _bullets(pos.reasons),

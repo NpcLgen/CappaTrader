@@ -118,6 +118,13 @@ def cmd_walkforward(args, cfg: Config) -> int:
     from cappatrader.backtest.walkforward import walk_forward
 
     data = _data(args, cfg)
+    need, have = cfg.walkforward.is_bars + cfg.walkforward.oos_bars, min((len(d) for d in data.values()), default=0)
+    if have < need:  # say it before the expensive HMM/GARCH layers are fitted
+        days = math.ceil(need * cfg.bar_ms / 86_400_000) + 1
+        print(f"✘ Walk-forward için en az {need} bar gerekli (IS {cfg.walkforward.is_bars} + OOS "
+              f"{cfg.walkforward.oos_bars}), mevcut {have}. --days değerini en az {days} yapın "
+              "veya walkforward.is_bars / oos_bars değerlerini küçültün.")
+        return 1
     res = walk_forward(cfg, data, _ml(cfg, data), progress=print, layers=_layers(cfg, data))
     text = res.summary()
     print(text)
@@ -415,10 +422,13 @@ def cmd_check(args, cfg: Config) -> int:
             if cfg.secrets.has_binance and not (cfg.mode == "live" and cfg.live.env == "demo"):
                 # demo.binance.com keys have no /sapi endpoint; restrictions are checked only for real keys
                 r = await rest.api_restrictions()
-                print(f"{'✘' if r.get('enableWithdrawals') else '✔'} API anahtarı: para çekme "
+                real_money = cfg.mode == "live"  # mainnet here: PRD §6 requires the IP restriction for real orders
+                bad = bool(r.get("enableWithdrawals")) or (real_money and not r.get("ipRestrict"))
+                print(f"{'✘' if bad else '✔'} API anahtarı: para çekme "
                       f"{'AÇIK — hemen kapatın!' if r.get('enableWithdrawals') else 'kapalı'}, IP kısıtlaması "
-                      f"{'var' if r.get('ipRestrict') else 'yok'}")
-                ok = ok and not r.get("enableWithdrawals")
+                      + ("var" if r.get("ipRestrict") else
+                         "YOK — gerçek parayla işlem için sunucu IP'sine kısıtlayın" if real_money else "yok"))
+                ok = ok and not bad
             elif not cfg.secrets.has_binance:
                 print("· Binance API anahtarı yok (paper mod için gerekli değil)" if cfg.mode != "live"
                       else "✘ Binance API anahtarı yok (live mod için gerekli)")
@@ -534,7 +544,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # one clear Turkish line instead of a traceback; details go to the log file
         log.debug("Komut hatası", exc_info=True)
         print(f"✘ {args.command} başarısız: {_explain_error(exc)}", file=sys.stderr)
-        print("  (Ayrıntı: logs/cappatrader.log; tam hata izi için -v ile çalıştırın)", file=sys.stderr)
+        log_file = Path(cfg.runtime.log_dir) / "cappatrader.log"
+        print(f"  (Ayrıntı: {log_file}; tam hata izi için -v ile çalıştırın)", file=sys.stderr)
         if args.verbose:
             raise
         return 1

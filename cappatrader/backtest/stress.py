@@ -53,7 +53,10 @@ class StressResult:
         lines.append("— Sinyalden sonra bar gecikmesi —")
         lines += [row(r, f"{int(r.value)} bar geç") for r in self.delay]
         be = self.breakeven_extra_bps
-        if self.realistic.total_return <= 0:
+        if self.ideal.total_return <= 0:
+            verdict = ("Strateji maliyetsiz ideal dolumlarla bile kârsız: sinyallerde avantaj yok "
+                       "(sorun maliyet değil, stratejinin kendisi).")
+        elif self.realistic.total_return <= 0:
             verdict = "Strateji gerçekçi maliyetlerle ZATEN kârsız: kâğıt üstündeki kâr maliyetlere gidiyor."
         elif math.isinf(be):
             worst = max((r.value for r in self.slippage), default=0)

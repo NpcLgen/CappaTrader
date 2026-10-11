@@ -19,7 +19,7 @@ import pandas as pd
 from cappatrader import fmt
 from cappatrader.config import Config
 from cappatrader.models import LONG, SHORT, Decision, Position
-from cappatrader.regime.detector import REGIME_TR, UNKNOWN, VOL_EXTREME, VOL_TR
+from cappatrader.regime.detector import UNKNOWN, VOL_EXTREME, VOL_TR, regime_name
 from cappatrader.strategy.decision import FrameView
 
 STYLE = "SQZ"
@@ -152,7 +152,7 @@ def _mark(sign: float, side: int) -> str:
 
 def _regime_line(row: pd.Series) -> str:
     regime = row.get("regime")
-    parts = [f"Rejim: {REGIME_TR.get(regime, regime)}"]
+    parts = [f"Rejim: {regime_name(regime)}"]
     prob = row.get("hmm_prob")
     if _ok(prob):
         parts.append(f"HMM olasılığı %{prob * 100:.0f}")

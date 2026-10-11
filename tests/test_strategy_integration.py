@@ -170,7 +170,9 @@ def test_explain_decision_dispatch(cfg, universe):
     f = prepare_universe(universe, cfg)["BTCUSDT"]
     row = f.iloc[-1]
     lines = explain_decision(cfg, row, LONG, {"orderflow": "Emir defteri notu"})
-    assert lines[0].startswith("Rejim") and any("VWAP" in x for x in lines) and lines[-1] == "Emir defteri notu"
+    assert lines[0].startswith("Rejim") and any("VWAP" in x for x in lines)
+    assert "Emir defteri notu" not in lines  # squeeze ignores order flow: never presented as a reason
+    assert "ortalamaya dönüş" not in lines[0]  # the RANGE hint belongs to the ensemble strategy
     ens = cfg.with_overrides({"strategy.name": "ensemble"})
     assert any("Ensemble skoru" in x for x in explain_decision(ens, row, LONG))
 

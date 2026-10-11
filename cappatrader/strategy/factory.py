@@ -71,7 +71,6 @@ def explain_decision(cfg: Config, row: pd.Series, side: int, live_notes: dict[st
     if is_squeeze(cfg):
         from cappatrader.strategy.squeeze_decision import explain_squeeze
 
-        lines = explain_squeeze(row, side, cfg)
-        lines.extend(text for text in (live_notes or {}).values() if text)
-        return lines
+        # the squeeze rules ignore order flow and sentiment: never list them as a reason for the trade
+        return explain_squeeze(row, side, cfg)
     return explain(row, side, cfg, live_notes)

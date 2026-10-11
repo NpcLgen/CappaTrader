@@ -155,7 +155,8 @@ class LiveEngine:
     def alert(self, title: str, text: str, kind: str = "ALERT") -> None:
         log.warning("%s: %s", title, text)
         self.store.record_event(_now().isoformat(), kind, f"{title}: {text}")
-        self.notifier.notify(msg.alert_message(title, text))
+        # paper and live accounts can report to the same chat: say which one is talking
+        self.notifier.notify(msg.alert_message(f"{title} · {self.cfg.mode_label}", text))
 
     def _spawn(self, sym: str, coro) -> None:
         if sym in self.inflight:
@@ -985,7 +986,8 @@ class LiveEngine:
         try:
             boot.result()
         except Exception as exc:
-            self.notifier.notify(msg.alert_message("Başlatma hatası", f"{type(exc).__name__}: {exc}"))
+            self.notifier.notify(msg.alert_message(f"Başlatma hatası · {self.cfg.mode_label}",
+                                                   f"{type(exc).__name__}: {exc}"))
             await self.shutdown(send_message=False)
             raise
         if self.cfg.telegram.send_startup:
@@ -1007,7 +1009,7 @@ class LiveEngine:
                 self.crashed = True
                 log.error("Arka plan görevi çöktü: %s", t.get_name(), exc_info=t.exception())
                 self.notifier.notify(msg.alert_message(
-                    "Bot beklenmedik şekilde durdu",
+                    f"Bot beklenmedik şekilde durdu · {self.cfg.mode_label}",
                     f"'{t.get_name()}' görevi çöktü: {type(t.exception()).__name__}: {t.exception()}. "
                     + self._protection_text() + " "
                     + "Botu yeniden başlatın."))
@@ -1033,7 +1035,7 @@ class LiveEngine:
             log.error("Hesap kaydedilemedi: %s", exc)
         if send_message and not self.crashed:
             self.notifier.notify(msg.alert_message(
-                "CappaTrader durduruldu",
+                f"CappaTrader durduruldu · {self.cfg.mode_label}",
                 f"Bakiye {self.equity():,.2f} USDT, açık pozisyon {len(self.account.positions)} "
                 "(pozisyonlar kayıtlı; yeniden başlatınca takip devam eder)."
                 + (f" {self._protection_text()}" if self.account.positions else "")
