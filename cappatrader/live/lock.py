@@ -12,6 +12,8 @@ fcntl (Windows) fall back to the PID check.
 
 from __future__ import annotations
 
+import errno
+import logging
 import os
 from pathlib import Path
 
@@ -19,6 +21,12 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows
     fcntl = None
+
+
+log = logging.getLogger(__name__)
+
+# flock errors that mean "another process holds it"; anything else means the filesystem cannot flock
+_HELD = {errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES}
 
 
 def lock_path(state_db: str) -> Path:
@@ -44,23 +52,29 @@ def _read_pid(p: Path) -> int | None:
         return None
 
 
+def _pid_check(p: Path) -> int | None:
+    pid = _read_pid(p)
+    return pid if pid is not None and pid != os.getpid() and _pid_alive(pid) else None
+
+
 def running_pid(state_db: str) -> int | None:
     """PID of the engine holding the lock (0 when held but the PID is unreadable), or None."""
     p = lock_path(state_db)
     if not p.exists():
         return None
     if fcntl is None:
-        pid = _read_pid(p)
-        return pid if pid is not None and pid != os.getpid() and _pid_alive(pid) else None
+        return _pid_check(p)
     try:
         fd = os.open(p, os.O_RDONLY)
     except OSError:
         return None
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        pid = _read_pid(p)
-        return pid if pid is not None else 0
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)  # conflicts with the engine's exclusive lock
+    except OSError as exc:
+        if exc.errno in _HELD:
+            pid = _read_pid(p)
+            return pid if pid is not None else 0
+        return _pid_check(p)  # this filesystem cannot flock (e.g. some NFS / CIFS mounts): PID file only
     else:
         fcntl.flock(fd, fcntl.LOCK_UN)
         return None  # a leftover file from an engine that exited: nobody holds it
@@ -91,9 +105,18 @@ class RunLock:
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError as exc:
             os.close(fd)
-            self._refuse(_read_pid(self.path))
+            if exc.errno in _HELD:
+                self._refuse(_read_pid(self.path))
+            # no flock on this filesystem: fall back to the PID file (not safe across containers)
+            log.warning("Kilit dosyası flock desteklemiyor (%s); PID tabanlı kilit kullanılıyor", exc)
+            other = _pid_check(self.path)
+            if other is not None:
+                self._refuse(other)
+            self.path.write_text(str(os.getpid()))
+            self.held = True
+            return
         os.ftruncate(fd, 0)
         os.write(fd, str(os.getpid()).encode())
         os.fsync(fd)

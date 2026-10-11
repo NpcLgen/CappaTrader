@@ -177,6 +177,9 @@ def cmd_pairs(args, cfg: Config) -> int:
     data = _data(args, cfg)
     print(f"Engle-Granger eşbütünleşme testi (5% kritik değer {EG_CRITICAL['5%']})")
     for a, b in cfg.pairs:
+        if a not in data or b not in data:  # squeeze configs may keep pairs of symbols they do not trade
+            print(f"{fmt.pair(a)} ~ {fmt.pair(b)}: atlandı (pariteler `symbols` listesinde değil)")
+            continue
         if min(len(data[a]), len(data[b])) < 50:
             print(f"{fmt.pair(a)} ~ {fmt.pair(b)}: yetersiz veri (en az 50 bar gerekli)")
             continue

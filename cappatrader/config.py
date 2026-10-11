@@ -504,9 +504,13 @@ _TYPE_TR = {bool: "true/false", int: "tam sayı", float: "sayı", str: "metin", 
 
 def _typed(path: str, current: Any, value: Any) -> Any:
     """YAML value checked against the type of the default (a quoted "3" for a number is a typo)."""
-    if current is None or value is None:
+    if current is None:
         return value
     kind = type(current)
+    if value is None:  # an empty YAML key (`grid:`) means an empty collection, never None for a list / dict
+        if kind in (list, dict):
+            return kind()
+        raise ValueError(f"{path}: {_TYPE_TR.get(kind, kind.__name__)} bekleniyor, boş bırakılmış")
     ok = (isinstance(value, bool) if kind is bool else
           isinstance(value, (int, float)) and not isinstance(value, bool) if kind in (int, float) else
           isinstance(value, kind) if kind in (str, list, dict) else True)

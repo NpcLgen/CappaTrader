@@ -85,3 +85,35 @@ def test_walkforward_precheck_counts_the_union_of_bars(tmp_path, monkeypatch, ca
     cli.main(["--config", str(_cfg_file(tmp_path, body)), "walkforward", "--no-ml"])
     assert seen.get("called")  # 1200 union bars >= 1100: not refused because ETH alone is shorter
     assert pd.Timestamp(u["ETHUSDT"].index[0]) > pd.Timestamp(u["BTCUSDT"].index[0])
+
+
+def test_empty_yaml_collections_are_empty_not_none(tmp_path):
+    c = load_config(_cfg_file(tmp_path, "walkforward:\n  grid:\n"), env_file=None)
+    assert c.walkforward.grid == {}
+    with pytest.raises(ValueError, match="en az bir rejim"):
+        load_config(_cfg_file(tmp_path, "strategy:\n  squeeze:\n    tradeable_regimes:\n"), env_file=None)
+    with pytest.raises(ValueError, match="live.leverage: tam sayı bekleniyor, boş"):
+        load_config(_cfg_file(tmp_path, "live:\n  leverage:\n"), env_file=None)
+
+
+def test_pairs_command_skips_pairs_outside_the_symbols(tmp_path, capsys):
+    rc = cli.main(["--config", str(_cfg_file(tmp_path, "symbols: [BTCUSDT]\npairs:\n  - [ETHUSDT, BTCUSDT]\n")),
+                   "pairs", "--synthetic", "--bars", "300"])
+    assert rc == 0 and "atlandı" in capsys.readouterr().out
+
+
+def test_squeeze_entry_shows_hmm_probability_only_with_an_hmm():
+    import pandas as pd
+
+    from cappatrader.models import Decision, Fill, Position
+    from cappatrader.notify import messages as msg
+
+    pos = Position(symbol="BTCUSDT", side=1, qty=0.01, entry_price=100.0, entry_time="2026-01-01", stop_price=98.0,
+                   initial_stop=98.0, risk_per_unit=2.0, best_price=100.0, entry_regime="TREND_UP",
+                   entry_confidence=50.0, entry_fee=0.0, entry_slippage_cost=0.0, reasons=["x"], take_profit=102.2,
+                   style="SQZ")
+    fill = Fill("BTCUSDT", 1, 0.01, 100.0, 100.0, 0.001, 0.0, 0.0, pd.Timestamp.now(tz="UTC"))
+    d = Decision("BTCUSDT", None, "ENTER_LONG", 0.5, 50.0, "TREND_UP", "NORMAL", 100.0, 1.0, style="SQZ")
+    head = lambda **k: msg.entry_message(pos, fill, d, [], 1000, 900, 1000, 1, **k).splitlines()[4]  # noqa: E731
+    assert "HMM" not in head() and "HMM" not in head(hmm_prob=float("nan"))
+    assert "HMM olasılığı %66" in head(hmm_prob=0.66)

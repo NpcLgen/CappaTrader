@@ -110,6 +110,8 @@ class LiveEngine:
         self.stale_orders: dict[str, list[str] | None] = {}
         # exchange order ids of each position's stop / target (persisted: a restart replaces them by id)
         self.protection_ids: dict[str, list[str]] = dict(self.store.get_kv("protection_ids") or {})
+        self._closed_at: dict[str, float] = {}  # monotonic time of the bot's last close per symbol
+        self._task_alerted: dict[str, float] = {}  # rate limit for "order task failed" alerts
         self.inflight: set[str] = set()
         self.tasks: set[asyncio.Task] = set()
         self.protection = False
@@ -121,9 +123,12 @@ class LiveEngine:
         self.dirty = False
         self.crashed = False
         hm, gc = cfg.regime.hmm, cfg.regime.garch
-        self.max_bars = max(cfg.runtime.history_bars, cfg.signals.ml.train_bars + 300,
-                            hm.train_bars + hm.feature_window + 100, gc.train_bars + 100,
-                            cfg.strategy.squeeze.length * 3 + 50)
+        # a whole anchored refit chunk must fit: training window + the chunk itself (+ margin)
+        self.max_bars = max(cfg.runtime.history_bars,
+                            cfg.signals.ml.train_bars + 300 if self.use_ml else 0,
+                            hm.train_bars + hm.feature_window + hm.retrain_every + 50,
+                            gc.train_bars + gc.retrain_every + 50,
+                            cfg.strategy.squeeze.length * 4 + 50)
         self.stop_event: asyncio.Event | None = None
         self.lock = RunLock(cfg.state_db)
         self._http = http
@@ -171,7 +176,11 @@ class LiveEngine:
             self.inflight.discard(sym)
             if not t.cancelled() and t.exception() is not None:
                 log.error("Emir görevi hata verdi (%s)", sym, exc_info=t.exception())
-                self.alert("Emir görevi hata verdi", f"{fmt.pair(sym)}: {type(t.exception()).__name__}: {t.exception()}")
+                now = time.monotonic()
+                if now - self._task_alerted.get(sym, -math.inf) >= 600:  # retries must not flood the chat
+                    self._task_alerted[sym] = now
+                    self.alert("Emir görevi hata verdi",
+                               f"{fmt.pair(sym)}: {type(t.exception()).__name__}: {t.exception()}")
 
         task.add_done_callback(done)
 
@@ -231,6 +240,10 @@ class LiveEngine:
         if self.live:
             if cfg.live.env == "mainnet":  # demo.binance.com keys have no /sapi endpoint
                 restrictions = await self._check_api_key()
+                if not restrictions:
+                    raise RuntimeError("API anahtarının yetkileri okunamadı (para çekme kapalı mı doğrulanamadı); "
+                                       "gerçek parayla işlem başlatılmadı. Bağlantıyı kontrol edip tekrar deneyin: "
+                                       "python -m cappatrader check")
                 if restrictions.get("enableWithdrawals"):
                     raise RuntimeError("API anahtarında PARA ÇEKME yetkisi açık: gerçek parayla işlem bu anahtarla "
                                        "başlatılmaz. Binance > API Yönetimi'nden para çekmeyi kapatın ve IP kısıtlaması "
@@ -299,7 +312,10 @@ class LiveEngine:
                 self.warnings.append(w)
         self._broker_warnings(drain_only=True)
         await self.refresh_balance()
-        seed = self._fresh_account or (not self.account.trades and not self.account.positions)
+        seed = (self._fresh_account or (not self.account.trades and not self.account.positions)
+                or bool(self.store.get_kv("seed_pending")))
+        if seed:  # durable: a start interrupted after adopting positions must still seed on the next one
+            self.store.set_kv("seed_pending", "1")
         self.binance_balance_note = (f"Binance futures: cüzdan {fmt.usd(self.wallet or 0)}, "
                                      f"kullanılabilir {fmt.usd(self.available or 0)}")
         await self.reconcile_positions(startup=True)
@@ -309,6 +325,7 @@ class LiveEngine:
             self._reset_account_balance(self.equity())
             self.account.cash = self.available if self.available is not None else self.account.cash
             self.store.save_account(self.account)
+            self.store.set_kv("seed_pending", "")
         if self.store.get_kv("reseed_peak"):
             # `resume` cannot know the live equity offline: restart the drawdown / daily windows from Binance's
             a, eq = self.account, self.equity()
@@ -337,6 +354,7 @@ class LiveEngine:
     async def _record_close(self, sym: str, fill: Fill, reason: str) -> None:
         if sym not in self.account.positions:
             return
+        self._closed_at[sym] = time.monotonic()
         self.unprotected.discard(sym)
         self.close_retry.pop(sym, None)
         if self.protection_ids.pop(sym, None) is not None:
@@ -507,6 +525,7 @@ class LiveEngine:
         """Make the local ledger agree with the exchange: record positions the exchange closed,
         adopt exchange positions the bot does not know (no orphan positions, PRD §6)."""
         held = list(dict.fromkeys([*self.symbols, *self.account.positions]))
+        snapshot_at = time.monotonic()
         ex = await self.futures.positions(held)
         adopted: set[str] = set()
         for sym, pos in list(self.account.positions.items()):
@@ -531,6 +550,8 @@ class LiveEngine:
         for sym, e in ex.items():
             if sym in self.account.positions or sym in self.inflight:
                 continue
+            if self._closed_at.get(sym, -math.inf) >= snapshot_at:
+                continue  # the bot closed it while this pass was running: the snapshot is stale, not an orphan
             if sym not in self.symbols:
                 self.alert("Yönetilmeyen pozisyon",
                            f"Borsada {fmt.pair(sym)} pozisyonu var ama ayarlarda bu parite yok; bot dokunmuyor.")
@@ -852,9 +873,10 @@ class LiveEngine:
                 if self.account.halted:  # the kill-switch fired while the stop was being placed
                     await self.close_position(sym, "Kill-switch emir iletimi sırasında tetiklendi — pozisyon hemen kapatıldı")
                     return
+            prob = row.get("hmm_prob") if cfg.regime.method == "hmm" else None
             self.notifier.notify(msg.entry_message(
                 pos, fill, d, sz.notes, self.equity(), self.cash(), self.account.starting_balance,
-                len(self.account.positions), mode=cfg.mode_label))
+                len(self.account.positions), mode=cfg.mode_label, hmm_prob=prob))
 
     async def close_position(self, sym: str, reason: str) -> None:
         pos = self.account.positions.get(sym)
@@ -878,7 +900,11 @@ class LiveEngine:
             finally:
                 self._broker_warnings()
             if fill is None:
-                fill = await self.futures.last_close_fill(sym, _ms(pos.entry_time), pos.side)
+                try:
+                    fill = await self.futures.last_close_fill(sym, _ms(pos.entry_time), pos.side)
+                except Exception as exc:  # the position is flat either way: record it rather than retry forever
+                    log.warning("%s kapanış dolumu okunamadı: %s", sym, exc)
+                    fill = None
                 reason = f"{reason} (pozisyon borsada zaten kapanmıştı)"
                 if fill is None:
                     fill = self._synthetic_fill(sym, -pos.side, pos.qty)

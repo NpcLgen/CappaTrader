@@ -764,3 +764,132 @@ def test_ensemble_bar_close_without_atr_does_not_crash(live_mode_cfg, universe):
 
     eng = asyncio.run(scenario())
     assert eng.account.positions["ETHUSDT"].bars_held == 1
+
+
+def test_interrupted_first_start_still_seeds_the_ledger(live_mode_cfg, universe, tmp_path):
+    live_mode_cfg.runtime.state_db = str(tmp_path / "s.sqlite")
+    px = float(universe["ETHUSDT"]["close"].iloc[-2])
+    fut = FakeFutures(positions={"ETHUSDT": XPos("ETHUSDT", 1, 0.05, px)}, wallet=400.0)
+    store0 = StateStore(live_mode_cfg.state_db)
+    store0.reset(1000.0)  # reset ledger with the config's virtual 1000 USDT
+    store0.close()
+    orig = fut.place_protection
+
+    async def interrupted(*a, **k):
+        raise asyncio.CancelledError()  # SIGTERM / Ctrl+C while the adopted orphan is being protected
+
+    async def start(protect):
+        fut.place_protection = protect
+        eng = LiveEngine(live_mode_cfg, rest=FakeREST(universe), notifier=CaptureNotifier(),
+                         store=StateStore(live_mode_cfg.state_db), futures=fut)
+        try:
+            await eng.bootstrap()
+        except asyncio.CancelledError:
+            eng.store.close()
+            return None
+        await eng.check_guards()
+        return eng
+
+    assert asyncio.run(start(interrupted)) is None
+    eng = asyncio.run(start(orig))
+    a = eng.account
+    assert not a.halted and "ETHUSDT" in a.positions and fut.pos  # the real position was not market-closed
+    assert a.peak_equity == pytest.approx(eng.equity()) and a.starting_balance < 1000.0
+    assert not eng.store.get_kv("seed_pending")
+
+
+def test_reconcile_does_not_adopt_a_position_the_bot_closed_meanwhile(live_mode_cfg, universe):
+    fut = FakeFutures()
+
+    async def scenario():
+        eng = _engine(live_mode_cfg, universe, fut)
+        await eng.bootstrap()
+        for sym in ("BTCUSDT", "ETHUSDT"):
+            await _book(eng, sym, eng.last_price[sym])
+            d, row = _decision(eng, live_mode_cfg, sym)
+            await eng.open_position(sym, d, row, {})
+        fut.pos.pop("ETHUSDT")  # ETH was closed by its exchange stop
+        orig = fut.last_close_fill
+
+        async def close_btc_meanwhile(symbol, since_ms, side):
+            if "BTCUSDT" in eng.account.positions:  # a tick stop closes BTC while reconcile awaits
+                await eng.close_position("BTCUSDT", "Zarar-kes (stop-loss) tetiklendi")
+            return await orig(symbol, since_ms, side)
+
+        fut.last_close_fill = close_btc_meanwhile
+        await eng.reconcile_positions()
+        return eng
+
+    eng = asyncio.run(scenario())
+    assert not eng.account.positions  # the stale snapshot's BTC row was not adopted as an orphan
+    assert not any("Sahipsiz pozisyon" in m for m in eng.notifier.messages)
+    assert sorted(t.symbol for t in eng.account.trades) == ["BTCUSDT", "ETHUSDT"]
+
+
+def test_flatten_retries_do_not_flood_telegram(live_mode_cfg, universe):
+    fut = FakeFutures()
+
+    async def scenario():
+        eng = _engine(live_mode_cfg, universe, fut)
+        await eng.bootstrap()
+        await _book(eng, "BTCUSDT", eng.last_price["BTCUSDT"])
+        d, row = _decision(eng, live_mode_cfg, "BTCUSDT")
+        await eng.open_position("BTCUSDT", d, row, {})
+        fut.already_closed = True
+
+        async def broken(*a, **k):
+            raise RuntimeError("429 Too Many Requests")
+
+        fut.last_close_fill = broken
+        eng.account.halted, eng.account.halt_reason = True, "test"
+        for _ in range(3):
+            eng._flatten_if_halted()
+            await asyncio.gather(*list(eng.tasks))
+        return eng
+
+    eng = asyncio.run(scenario())
+    assert not eng.account.positions and len(eng.account.trades) == 1  # recorded with a synthetic fill
+    assert not any("Emir görevi hata verdi" in m for m in eng.notifier.messages)
+
+
+def test_mainnet_refuses_when_key_permissions_cannot_be_read(live_mode_cfg, universe):
+    from cappatrader.config import MAINNET_CONFIRM_PHRASE
+
+    c = live_mode_cfg.with_overrides({"live.env": "mainnet", "live.mainnet_confirm": MAINNET_CONFIRM_PHRASE})
+    c.symbols, c.pairs, c.secrets = live_mode_cfg.symbols, live_mode_cfg.pairs, live_mode_cfg.secrets
+
+    class NoSapi(FakeREST):
+        async def api_restrictions(self):
+            raise TimeoutError("sapi timed out")
+
+    async def scenario():
+        eng = LiveEngine(c, rest=NoSapi(universe), notifier=CaptureNotifier(), store=StateStore(":memory:"),
+                         futures=FakeFutures())
+        await eng.bootstrap()
+
+    with pytest.raises(RuntimeError, match="yetkileri okunamadı"):
+        asyncio.run(scenario())
+
+
+def test_live_buffer_holds_a_whole_refit_chunk(live_mode_cfg):
+    c = live_mode_cfg.with_overrides({"signals.ml.train_bars": 400})
+    eng = LiveEngine(c, rest=object(), notifier=CaptureNotifier(), store=StateStore(":memory:"), futures=FakeFutures())
+    hm, gc = c.regime.hmm, c.regime.garch
+    assert eng.max_bars >= hm.train_bars + hm.feature_window + hm.retrain_every
+    assert eng.max_bars >= gc.train_bars + gc.retrain_every
+
+
+def test_lock_falls_back_when_the_filesystem_cannot_flock(tmp_path, monkeypatch):
+    import errno
+
+    import cappatrader.live.lock as lockmod
+
+    def no_flock(fd, op):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(lockmod.fcntl, "flock", no_flock)
+    db = str(tmp_path / "s.sqlite")
+    lock = RunLock(db)
+    lock.acquire()  # not refused as "already running"
+    assert running_pid(db) is None  # our own PID in the file: nobody else holds it
+    lock.release()

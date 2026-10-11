@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from html import escape
 
 import pandas as pd
@@ -29,8 +30,16 @@ def balance_block(equity: float, cash: float, start: float, open_positions: int)
             f"Nakit {fmt.usd(cash)} · açık pozisyon {open_positions}")
 
 
+def _finite(x) -> bool:
+    try:
+        return x is not None and math.isfinite(float(x))
+    except (TypeError, ValueError):
+        return False
+
+
 def entry_message(pos: Position, fill: Fill, d: Decision, sizing_notes: list[str], equity: float, cash: float,
-                  start_balance: float, open_positions: int, mode: str = "KAĞIT HESAP") -> str:
+                  start_balance: float, open_positions: int, mode: str = "KAĞIT HESAP",
+                  hmm_prob: float | None = None) -> str:
     long = pos.side == LONG
     head = "🟢 <b>ALIŞ (LONG)" if long else "🟠 <b>AÇIĞA SATIŞ (SHORT)"
     asset = fmt.base_asset(pos.symbol)
@@ -44,7 +53,8 @@ def entry_message(pos: Position, fill: Fill, d: Decision, sizing_notes: list[str
         f"Miktar: {fmt.qty(pos.qty)} {escape(asset)} ≈ {fmt.usd(fill.notional)} · komisyon {fill.fee:.2f} USDT",
         f"Stop: <code>{fmt.price(pos.stop_price)}</code> ({fmt.pct(stop_pct, signed=True)}) · risk {fmt.usd(risk_amt)} "
         f"(%{risk_amt / equity * 100:.2f} kasa)" + (f" · hedef {fmt.price(pos.take_profit)}" if pos.take_profit else ""),
-        (f"Rejim: {escape(regime_name(d.regime))} · HMM olasılığı %{d.confidence:.0f} · strateji: {style}"
+        (f"Rejim: {escape(regime_name(d.regime))}"
+         + (f" · HMM olasılığı %{hmm_prob * 100:.0f}" if _finite(hmm_prob) else "") + f" · strateji: {style}"
          if pos.style == "SQZ" else
          f"Rejim: {escape(REGIME_TR.get(d.regime, d.regime))} · güven %{d.confidence:.0f} · strateji: {style}"),
         "",
