@@ -1,0 +1,20 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Runtime artefacts (anchored to the repo root so cappatrader/data/ stays tracked)
+/state/
+/logs/
+/data/
+/reports/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
